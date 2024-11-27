@@ -8,9 +8,9 @@ import sys
 import logging
 logging.basicConfig(level=logging.INFO)
 
-# Read the pipe_thickness argument
-pipe_thickness = float(sys.argv[-1])
-logging.info(pipe_thickness)
+# Read the applied_displacement argument
+applied_displacement = float(sys.argv[-1])
+logging.info(applied_displacement)
 
 mdb.models.changeKey(fromName="Model-1", toName="cantilever_beam")
 viewports = session.viewports["Viewport: 1"]
@@ -39,7 +39,7 @@ viewports.partDisplay.geometryOptions.setValues(
 cantilever_beam_model.Material(name="steel")
 cantilever_beam_model.materials["steel"].Density(table=((7850.0,),))
 cantilever_beam_model.materials["steel"].Elastic(table=((210000000000.0, 0.3),))
-cantilever_beam_model.PipeProfile(name="pipe_profile", r=0.3, t=pipe_thickness)
+cantilever_beam_model.PipeProfile(name="pipe_profile", r=0.3, t=0.015)
 cantilever_beam_model.BeamSection(
     name="pipe_section",
     integration=DURING_ANALYSIS,
@@ -133,7 +133,7 @@ cantilever_beam_model.DisplacementBC(
     createStepName="Step-1",
     region=region,
     u1=0.0,
-    u2=-0.02,
+    u2=-applied_displacement,
     u3=0.0,
     amplitude=UNSET,
     fixed=OFF,
