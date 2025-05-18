@@ -1,95 +1,81 @@
-#==================Setup==================#
-# Import necessary libraries and modules
+# ================== Setup ================== #
+import os
 import streamlit as st
+from dotenv import load_dotenv
 
-# Reload custom modules after import
-import importlib
-from src import tools, prompt_temp
-importlib.reload(tools)
-importlib.reload(prompt_temp)
+from phoenix.otel import register
+from phoenix.trace import suppress_tracing
+from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+import phoenix as px
 
-# Import specific tools and prompt templates from custom modules
-from src.tools import generate_input_file, run_abaqus, extract_von_mises_stress_from_ODB
-from src.prompt_temp import react_system_prompt as RA_SYSTEM_PROMPT
-
-# Import tools and agent framework from Llama Index
+from llama_index.llms.openai import OpenAI as llma_OpenAI
 from llama_index.core.tools import FunctionTool
 from llama_index.core.agent import ReActAgent
 
-# Import OpenAI LLM wrapper from Llama Index
-from llama_index.llms.openai import OpenAI as llma_OpenAI
+from src.tools import (
+    generate_input_file,
+    run_abaqus,
+    extract_von_mises_stress_from_ODB,
+)
+from src.prompt_temp import react_system_prompt as RA_SYSTEM_PROMPT
 
-# Loading environment variables
-from dotenv import load_dotenv
 load_dotenv(override=True)
 
-# Initialize the LLM and set it in Settings
-llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4o-mini"])
-llm = llma_OpenAI(model=llm_type)
+# ---------- observability (run once) ---------- #
+@st.cache_resource(show_spinner=False)
+def init_observability():
+    tp = register(
+        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        batch=True,   # BatchSpanProcessor => fewer packets
+    )
+    LlamaIndexInstrumentor().instrument(skip_dep_check=True, tracer_provider=tp)
+    return px.launch_app()
 
-#=====================tool#1========================#
-# Abaqus Input File Generation Tool
+session = init_observability()
+
+# ---------- LLM picker ---------- #
+llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4o-mini"])
+
+# ---------- tools ---------- #
 abaqus_input_file_tool = FunctionTool.from_defaults(
     fn=generate_input_file,
     name="Abaqus_input_file_generator",
-    description=(
-        "Generates an Abaqus input file with a specified applied displacement. "
-        "This tool leverages the `generate_input_file` function, which runs a Python script "
-        "to create the input file, then moves it to the designated directory for further use. "
-        "Useful for preparing finite element analysis models with customized pipe parameters."
-        "\n\n"
-        "Key Features:\n"
-        "1. Accepts an `applied displacement` value as an argument to customize the model.\n"
-        "2. Executes the Abaqus script `create_inp_file.py` to generate the `.inp` file.\n"
-        "3. Automatically moves the generated file to `src/abaqus_files/cantilever_beam.inp`.\n"
-        "4. Provides feedback on successful execution or errors during the process."
-    )
+    description="Generates an Abaqus input file with an applied displacement.",
 )
 
-#=====================tool#2========================#
-# Abaqus Job Execution Tool
 abaqus_job_execution_tool = FunctionTool.from_defaults(
     fn=run_abaqus,
     name="Abaqus_job_executor",
-    description=(
-        "Executes an Abaqus job using a pre-defined input file and organizes the output files. "
-        "This tool leverages the `run_abaqus` function to perform the following tasks:\n\n"
-        "Key Features:\n"
-        "1. Executes an Abaqus job using the input file `cantilever_beam.inp` located in the `src/abaqus_files` directory.\n"
-        "2. Collects all Abaqus-generated output files with names starting with `cantilever_beam`.\n"
-        "3. Automatically moves the collected files to the `src/abaqus_files` directory.\n"
-        "4. Provides detailed feedback on the success or failure of the Abaqus job execution."
-    )
+    description="Runs an Abaqus job with `cantilever_beam.inp` and collects outputs.",
 )
 
-#=====================tool#3========================#
-# Von-Mises Stress Extraction Tool
 von_mises_stress_extraction_tool = FunctionTool.from_defaults(
     fn=extract_von_mises_stress_from_ODB,
     name="Von_Mises_stress_extractor",
-    description=(
-        "Extracts Von-Mises stress data from the Abaqus ODB file. "
-        "This tool leverages the `extract_von_mises_stress_from_ODB` function to automate the process of retrieving stress data.\n\n"
-        "Key Features:\n"
-        "1. Executes the `retrieve_vm_stress.py` script using the Abaqus Python command.\n"
-        "2. Extracts Von-Mises stress data and saves it in the `max_vm_stress.txt` file.\n"
-        "3. Automatically moves the extracted stress data file to the `src/abaqus_files` directory.\n"
-        "4. Provides detailed feedback on the success or failure of the extraction process."
+    description="Extracts max Von-Mises stress from the ODB file.",
+)
+
+tools = [
+    abaqus_input_file_tool,
+    abaqus_job_execution_tool,
+    von_mises_stress_extraction_tool,
+]
+
+# ---------- init agent once ---------- #
+if "agent" not in st.session_state:
+    llm = llma_OpenAI(model=llm_type)
+    st.session_state.agent = ReActAgent.from_tools(
+        tools, llm=llm, verbose=True, max_iterations=100
     )
-)
+    # ➋ silence prompt book-keeping spans
+    with suppress_tracing():                         # :contentReference[oaicite:0]{index=0}
+        st.session_state.agent.update_prompts(
+            {"agent_worker:system_prompt": RA_SYSTEM_PROMPT()}
+        )
 
-# Initialize the ReAct Agent and pass the predefined tools
-agent = ReActAgent.from_tools(
-    [abaqus_input_file_tool, abaqus_job_execution_tool, von_mises_stress_extraction_tool], 
-    llm=llm, verbose=True, max_iterations=100
-)
+agent = st.session_state.agent
 
-# Load a custom system prompt
-react_system_prompt = RA_SYSTEM_PROMPT()
-
-# Update the agent with the custom system prompt
-agent.update_prompts({"agent_worker:system_prompt": react_system_prompt})
-
+# ================== UI ================== #
 st.title("Finite Element Analysis Assistant")
 st.markdown("""
             This AI agent is designed to seamlessly integrate with Abaqus to automate the simulation workflow for generating a model, running the job, and extracting stress data. It streamlines the following key steps:
@@ -104,36 +90,39 @@ st.markdown("""
 logo_file_path = "artifacts\cantilever_beam_schematic.png"
 st.image(logo_file_path, width=500)
 
-query_str = "For the cantilever beam, retrieve the maximum von Mises stress when the pipe is displaced downward by 0.02 m. Then, incrementally increase the displacement until the von Mises stress reaches 100 MPa. Adjust the displacement increments to optimize efficiency and minimize the number of required simulations."
+default_query = (
+    "For the cantilever beam, retrieve the maximum von Mises stress when the "
+    "pipe is displaced downward by 0.02 m. Then incrementally increase the "
+    "displacement until the von Mises stress reaches 100 MPa, minimising the "
+    "number of simulations."
+)
+query = st.text_area("Enter your query:", default_query)
 
-query = st.text_area("**Enter your query:**", query_str)
-
-# Create a task
-task = agent.create_task(query)
-
-# Iterate over the thought, action, and observation steps to complete the task
 if st.button("Submit"):
-    with st.spinner("Processing your query..."):
+    with st.spinner("Processing..."):
+        task = agent.create_task(query)
+
         with st.expander("Show Progress"):
             step_output = agent.run_step(task.task_id)
             st.markdown(step_output.dict()["output"]["response"])
-
-            # Check whether the task is complete
-            while step_output.is_last == False:
+            while not step_output.is_last:
                 step_output = agent.run_step(task.task_id)
                 st.markdown(step_output.dict()["output"]["response"])
 
-        # display the final response
         st.subheader("Final Answer:")
         st.markdown(step_output.dict()["output"]["response"])
 
         st.subheader("Reasoning:")
         with st.expander("Show Reasoning"):
-            # Display the intermediate reasoning steps
-            for step in agent.get_completed_tasks()[-1].extra_state[
-                "current_reasoning"
-            ]:
-                for key, value in step.dict().items():
-                    if key not in ("return_direct", "action_input", "is_streaming"):
-                        st.markdown(f"<span style='color: darkblue; font-weight: bold;'>{key}</span>: {value}", unsafe_allow_html=True)
+            # ➌ hide the 'get_completed_tasks' root span
+            with suppress_tracing():                 # :contentReference[oaicite:1]{index=1}
+                completed = agent.get_completed_tasks()[-1]
+
+            for step in completed.extra_state["current_reasoning"]:
+                for k, v in step.dict().items():
+                    if k not in ("return_direct", "action_input", "is_streaming"):
+                        st.markdown(
+                            f"<span style='color:darkblue;font-weight:bold;'>{k}</span>: {v}",
+                            unsafe_allow_html=True,
+                        )
                 st.markdown("----")

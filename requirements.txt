@@ -1,5 +1,12 @@
 llama-index-llms-openai
 python-dotenv==1.0.1
 streamlit==1.36.0
-llama_index==0.11.19
+llama-index>=0.10.0
+llama-index-core>=0.10.0
 importlib==1.0.4
+arize-phoenix[evals,llama-index]
+openai>=1
+httpx<0.28
+gcsfs
+nest-asyncio
+openinference-instrumentation-llama-index>=2.0.0
