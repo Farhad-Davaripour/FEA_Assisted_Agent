@@ -1,7 +1,9 @@
 # ================== Setup ================== #
 import os
+import json
 import streamlit as st
 from dotenv import load_dotenv
+import re
 
 from phoenix.otel import register
 from phoenix.trace import suppress_tracing
@@ -17,7 +19,20 @@ from src.tools import (
     run_abaqus,
     extract_von_mises_stress_from_ODB,
 )
-from src.prompt_temp import react_system_prompt as RA_SYSTEM_PROMPT
+from src.prompt_temp import react_system_prompt as RA_SYSTEM_PROMPT, TOOL_CALLING_PROMPT_TEMPLATE
+
+# --- evaluation helpers ---
+from phoenix.trace import SpanEvaluations
+from phoenix.trace.dsl import SpanQuery
+from phoenix.evals import (
+    TOOL_CALLING_PROMPT_RAILS_MAP,
+    llm_classify,
+    OpenAIModel,
+)
+import pandas as pd
+
+
+# -------------------------------------------- #
 
 load_dotenv(override=True)
 
@@ -26,7 +41,8 @@ load_dotenv(override=True)
 def init_observability():
     tp = register(
         endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
-        batch=True,   # BatchSpanProcessor => fewer packets
+        batch=True,
+        set_global_tracer_provider=False
     )
     LlamaIndexInstrumentor().instrument(skip_dep_check=True, tracer_provider=tp)
     return px.launch_app()
@@ -34,7 +50,7 @@ def init_observability():
 session = init_observability()
 
 # ---------- LLM picker ---------- #
-llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4o-mini"])
+llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4.1", "gpt-4o"])
 
 # ---------- tools ---------- #
 abaqus_input_file_tool = FunctionTool.from_defaults(
@@ -67,8 +83,7 @@ if "agent" not in st.session_state:
     st.session_state.agent = ReActAgent.from_tools(
         tools, llm=llm, verbose=True, max_iterations=100
     )
-    # ➋ silence prompt book-keeping spans
-    with suppress_tracing():                         # :contentReference[oaicite:0]{index=0}
+    with suppress_tracing():  # silence bookkeeping spans
         st.session_state.agent.update_prompts(
             {"agent_worker:system_prompt": RA_SYSTEM_PROMPT()}
         )
@@ -109,13 +124,14 @@ if st.button("Submit"):
                 step_output = agent.run_step(task.task_id)
                 st.markdown(step_output.dict()["output"]["response"])
 
+        final_answer = step_output.dict()["output"]["response"]
+
         st.subheader("Final Answer:")
-        st.markdown(step_output.dict()["output"]["response"])
+        st.markdown(final_answer)
 
         st.subheader("Reasoning:")
         with st.expander("Show Reasoning"):
-            # ➌ hide the 'get_completed_tasks' root span
-            with suppress_tracing():                 # :contentReference[oaicite:1]{index=1}
+            with suppress_tracing():
                 completed = agent.get_completed_tasks()[-1]
 
             for step in completed.extra_state["current_reasoning"]:
@@ -126,3 +142,106 @@ if st.button("Submit"):
                             unsafe_allow_html=True,
                         )
                 st.markdown("----")
+
+# ---------- full-trace evaluation ----------
+st.subheader("Tool-calling Evaluation")
+if st.button("Evaluate last run"):
+    with st.spinner("Grading tool use…"):
+        client = px.Client()
+
+        # 1️⃣ pull only the LLM spans that issued a tool call
+        q = (
+            SpanQuery()
+            .where("span_kind == 'LLM'")
+            .select(
+                question="input.value",
+                output_messages="llm.output_messages",
+            )
+        )
+        df = client.query_spans(q).dropna(subset=["output_messages"])
+
+        if df.empty:
+            st.info("No tool-calling LLM spans found in the latest trace.")
+            st.stop()
+
+        ACTION_RE  = re.compile(r"Action:\s*([A-Za-z0-9_]+)")
+        INPUT_RE   = re.compile(r"Action Input:\s*(\{.*\})", re.S)
+
+        def first_call(messages):
+            """
+            Return (tool_name, json_args) from the first assistant message that
+            contains either a structured tool_call OR a ReAct-style “Action:” line.
+            """
+            for m in messages:
+                msg = m.get("message", m)                  # tolerate either shape
+                if msg.get("role") != "assistant":
+                    continue
+
+                # ① open-AI structured calls (not present in your trace but keep it)
+                tc = msg.get("tool_calls", [])
+                if tc:
+                    fn   = tc[0]["function"]
+                    args = fn["arguments"]
+                    if not isinstance(args, str):
+                        args = json.dumps(args)
+                    return fn["name"], args
+
+                # ② ReAct text block – parse Action / Action Input
+                content = msg.get("content", "")
+                m_action = ACTION_RE.search(content)
+                if m_action:
+                    name = m_action.group(1)
+                    m_args = INPUT_RE.search(content)
+                    args = m_args.group(1) if m_args else "{}"
+                    # round-trip through json so the grader sees valid JSON
+                    try:
+                        args = json.dumps(json.loads(args))
+                    except json.JSONDecodeError:
+                        args = "{}"
+                    return name, args
+
+            return None, None
+
+        df[["tool_name", "tool_args"]] = (
+            df["output_messages"].apply(lambda msgs: pd.Series(first_call(msgs)))
+        )
+
+        eval_df = pd.DataFrame(
+            {
+                "question": df["question"],
+                "tool_call": df.apply(lambda r: f"{r.tool_name}({r.tool_args})", axis=1),
+                "tool_definitions": [tools] * len(df),
+            },
+            index=df.index,
+        )
+
+        eval_df.drop(columns="tool_definitions").to_csv("eval_input.csv", index=False)
+
+        # 2️⃣ run classifier (GPT-4o, temp-0)
+        judge = OpenAIModel(model=llm_type, temperature=0)
+        rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
+
+        graded = llm_classify(
+            data=eval_df,
+            template=TOOL_CALLING_PROMPT_TEMPLATE,
+            rails=rails,
+            model=judge,
+            provide_explanation=True,
+        )
+
+        graded["score"] = (graded["label"] == "correct").astype(float)
+        graded.index.name = "span_id"   # Phoenix expects this
+
+        # 3️⃣ write scores back to Phoenix
+        client.log_evaluations(
+            SpanEvaluations(
+                eval_name="Function-call correctness",
+                dataframe=graded,
+            )
+        )
+
+    # quick Streamlit summary
+    st.success(
+        f"✅ {int(graded['score'].sum())}/{len(graded)} calls marked correct "
+        "(now visible in Phoenix)"
+    )
