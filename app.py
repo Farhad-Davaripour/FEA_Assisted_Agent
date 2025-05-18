@@ -1,13 +1,11 @@
 # ================== Setup ================== #
-import os
-import json
-import streamlit as st
+import os, json, re, streamlit as st
 from dotenv import load_dotenv
-import re
 
 from phoenix.otel import register
-from phoenix.trace import suppress_tracing
+from phoenix.trace import suppress_tracing, SpanEvaluations
 from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+from phoenix.trace.dsl import SpanQuery
 import phoenix as px
 
 from llama_index.llms.openai import OpenAI as llma_OpenAI
@@ -19,11 +17,11 @@ from src.tools import (
     run_abaqus,
     extract_von_mises_stress_from_ODB,
 )
-from src.prompt_temp import react_system_prompt as RA_SYSTEM_PROMPT, TOOL_CALLING_PROMPT_TEMPLATE
-
-# --- evaluation helpers ---
-from phoenix.trace import SpanEvaluations
-from phoenix.trace.dsl import SpanQuery
+from src.prompt_temp import (
+    react_system_prompt as RA_SYSTEM_PROMPT,
+    TOOL_CALLING_PROMPT_TEMPLATE,
+    TOOL_UNIT_PROMPT_TEMPLATE
+)
 from phoenix.evals import (
     TOOL_CALLING_PROMPT_RAILS_MAP,
     llm_classify,
@@ -46,38 +44,33 @@ def init_observability():
     )
     LlamaIndexInstrumentor().instrument(skip_dep_check=True, tracer_provider=tp)
     return px.launch_app()
-
 session = init_observability()
 
 # ---------- LLM picker ---------- #
-llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4.1", "gpt-4o"])
+llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4.1"])
 
 # ---------- tools ---------- #
 abaqus_input_file_tool = FunctionTool.from_defaults(
     fn=generate_input_file,
     name="Abaqus_input_file_generator",
-    description="Generates an Abaqus input file with an applied displacement.",
+    description="Generates an Abaqus input file with an applied displacement (unit: metres). The applied displacement should not exceed 0.2 metres.",
 )
-
 abaqus_job_execution_tool = FunctionTool.from_defaults(
     fn=run_abaqus,
     name="Abaqus_job_executor",
     description="Runs an Abaqus job with `cantilever_beam.inp` and collects outputs.",
 )
-
 von_mises_stress_extraction_tool = FunctionTool.from_defaults(
     fn=extract_von_mises_stress_from_ODB,
     name="Von_Mises_stress_extractor",
-    description="Extracts max Von-Mises stress from the ODB file.",
+    description="Extracts max Von-Mises stress from the ODB file (returns MPa).",
 )
-
 tools = [
     abaqus_input_file_tool,
     abaqus_job_execution_tool,
     von_mises_stress_extraction_tool,
 ]
-
-# ---------- init agent once ---------- #
+# ---------- init agent (once) ---------- #
 if "agent" not in st.session_state:
     llm = llma_OpenAI(model=llm_type)
     st.session_state.agent = ReActAgent.from_tools(
@@ -243,5 +236,71 @@ if st.button("Evaluate last run"):
     # quick Streamlit summary
     st.success(
         f"✅ {int(graded['score'].sum())}/{len(graded)} calls marked correct "
+        "(now visible in Phoenix)"
+    )
+
+# ---------- parameter‑unit evaluation ----------
+st.subheader("Parameter-unit Evaluation")
+if st.button("Check parameter units"):
+    with st.spinner("Checking units…"):
+        client = px.Client()
+
+        #  collect every TOOL span (one row per actual tool call)
+        q = (
+            SpanQuery()
+            .where("span_kind == 'TOOL'")
+            .select(
+                tool_name   = "tool.name",
+                tool_call   = "input.value",
+                tool_output = "output.value",
+            )
+        )
+        df_tool = client.query_spans(q)
+
+        if df_tool.empty:
+            st.info("No TOOL spans found in the latest trace.")
+            st.stop()
+
+        # --- robust mapping <tool‑name → FunctionTool object> -------------
+        tool_lookup = {}
+        for t in tools:
+            try:
+                tool_lookup[t.metadata.name] = t.metadata.description        # modern attribute
+            except AttributeError:
+                # very old FunctionTool (<0.9) had .name
+                tool_lookup[getattr(t, "name", None)] = t.metadata.description
+        # ---------------------------------------------------------------------
+
+        eval_df = pd.DataFrame(
+            {
+                "tool_call":   df_tool["tool_call"].astype(str),
+                "tool_output": df_tool["tool_output"].astype(str),
+                "tool_definition": df_tool["tool_name"].map(tool_lookup),
+            },
+            index=df_tool.index,
+        ).dropna(subset=["tool_definition"])   # drop rows we failed to match
+
+        judge = OpenAIModel(model=llm_type, temperature=0)
+        rails  = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
+
+        graded = llm_classify(
+            data       = eval_df,
+            template   = TOOL_UNIT_PROMPT_TEMPLATE,
+            rails      = rails,
+            model      = judge,
+            provide_explanation = True,
+        )
+        graded["score"] = (graded["label"] == "correct").astype(float)
+        graded.index.name = "span_id"
+
+        client.log_evaluations(
+            SpanEvaluations(
+                eval_name="Parameter-unit correctness",
+                dataframe=graded,
+            )
+        )
+
+    st.success(
+        f"✅ {int(graded['score'].sum())}/{len(graded)} tool calls have correct units "
         "(now visible in Phoenix)"
     )

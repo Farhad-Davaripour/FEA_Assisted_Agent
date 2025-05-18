@@ -91,3 +91,20 @@ Label as **Incorrect** otherwise.\n\n
 
     [Tool Definitions]: {tool_definitions}
 """
+
+TOOL_UNIT_PROMPT_TEMPLATE = """
+You are an evaluation assistant checking whether a tool was called with
+arguments expressed in the correct physical units.
+
+    [BEGIN DATA]
+    ************
+    [Tool Call]: {tool_call}
+    ************
+    [Tool Output]: {tool_output}
+    [END DATA]
+
+The tool’s doc-string (below) tells you what unit every parameter expects.
+Answer with a single word — "correct" or "incorrect" — and nothing else.
+
+    [Tool Definition]: {tool_definition}
+"""
