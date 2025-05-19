@@ -15,7 +15,6 @@ from src.tools import (
     generate_input_file,
     run_abaqus,
     extract_von_mises_stress_from_ODB,
-    parse_stress_mpa,
     extract_action,
 )
 from src.prompt_temp import (
@@ -30,7 +29,7 @@ from phoenix.evals import (
 )
 import pandas as pd
 
-from src.eval_utils import run_eval
+from src.eval_utils import run_eval, log_stress_eval_real_time
 
 load_dotenv(override=True)
 stress_threshold = float(os.getenv("STRESS_THRESHOLD", 350.0))
@@ -108,7 +107,7 @@ default_query = (
     "For the cantilever beam, retrieve the maximum von Mises stress when the "
     "pipe is displaced downward by 0.02 m. Then incrementally increase the "
     f"displacement until the von Mises stress reaches approximately {stress_threshold} MPa, minimising the "
-    "number of simulations. Do not increase the displacement by more than double in each step"
+    "number of simulations. Ensure you never pass the threshold during your trials."
 )
 query = st.text_area("Enter your query:", default_query)
 
@@ -117,11 +116,14 @@ if st.button("Submit"):
         task = agent.create_task(query)
 
         with st.expander("Show Progress"):
+            client = px.Client()
             step_output = agent.run_step(task.task_id)
             st.markdown(step_output.dict()["output"]["response"])
+            log_stress_eval_real_time(client)
             while not step_output.is_last:
                 step_output = agent.run_step(task.task_id)
                 st.markdown(step_output.dict()["output"]["response"])
+                log_stress_eval_real_time(client)
 
         final_answer = step_output.dict()["output"]["response"]
 
@@ -219,6 +221,7 @@ def hallucination_eval():
         judge=judge,
         eval_name="Hallucination",
         post_process=lambda df: df.tail(1),
+        num_steps=1,
     )
 
 # -------------- Streamlit buttons -------------- #
@@ -242,44 +245,3 @@ if st.button("Hallucination Eval"):
         st.info("No agent spans found in the latest trace.")
     else:
         st.success("✅ Final answer marked correct" if graded["score"].iloc[0] == 1 else "❌ Final answer marked incorrect")
-
-if st.button("Beam Failure Eval"):
-    with st.spinner("Beam Failure Eval"):
-        client = px.Client()
-
-        # ── 1. pick the span to attach the metric to ──────────────────────────
-        latest_span_id = (
-            client.query_spans(
-                SpanQuery()
-                .where("span_kind == 'AGENT' and name == 'ReActAgentWorker.run_step'")
-                .select() 
-            )
-            .sort_values("start_time")
-            .index[-1]  
-        )
-
-        # ── 2. deterministic stress check ─────────────────────────────────────
-        stress_val = parse_stress_mpa()
-        exceeds = stress_val is not None and stress_val > stress_threshold
-
-        graded_h = pd.DataFrame(
-            {
-                "label": ["exceeded" if exceeds else "not"],
-                "score": [float(exceeds)],
-            },
-            index=[latest_span_id], 
-        )
-        graded_h.index.name = "span_id"
-
-        # ── 3. write evaluation to Phoenix ────────────────────────────────────
-        client.log_evaluations(
-            SpanEvaluations(
-                eval_name=f"Stress Thresh",
-                dataframe=graded_h,
-            )
-        )
-
-    st.success(
-        f"✅ Stress exceeded {stress_threshold} MPa" if exceeds
-        else f"✅ Stress did not exceed {stress_threshold} MPa"
-    )

@@ -146,20 +146,6 @@ def extract_von_mises_stress_from_ODB():
     
     return f"von_mises stress is {data} MPa"
 
-def parse_stress_mpa(path="src/abaqus_files/max_vm_stress.txt"):
-    """Return the stress value in MPa if file exists, else None."""
-    try:
-        with open(path) as f:
-            text = f.read()
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
-        if not m:
-            return None
-        value = float(m.group(1))
-        if value > 1000:
-            value /= 1e6
-        return value
-    except OSError:
-        return None
     
 ACTION_RE = re.compile(r"Action:\s*([A-Za-z0-9_]+)")
 INPUT_RE  = re.compile(r"Action Input:\s*(\{.*\})", re.S)
