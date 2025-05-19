@@ -16,11 +16,14 @@ from src.tools import (
     generate_input_file,
     run_abaqus,
     extract_von_mises_stress_from_ODB,
+    parse_stress_mpa,
+    extract_action
 )
 from src.prompt_temp import (
     react_system_prompt as RA_SYSTEM_PROMPT,
     TOOL_CALLING_PROMPT_TEMPLATE,
-    TOOL_UNIT_PROMPT_TEMPLATE
+    TOOL_UNIT_PROMPT_TEMPLATE,
+    FINAL_HALLUCINATION_PROMPT_TEMPLATE
 )
 from phoenix.evals import (
     TOOL_CALLING_PROMPT_RAILS_MAP,
@@ -48,6 +51,7 @@ session = init_observability()
 
 # ---------- LLM picker ---------- #
 llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4.1"])
+llm_type_eval = st.sidebar.selectbox("Select LLM type", ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"])
 
 # ---------- tools ---------- #
 abaqus_input_file_tool = FunctionTool.from_defaults(
@@ -101,7 +105,7 @@ st.image(logo_file_path, width=500)
 default_query = (
     "For the cantilever beam, retrieve the maximum von Mises stress when the "
     "pipe is displaced downward by 0.02 m. Then incrementally increase the "
-    "displacement until the von Mises stress reaches 100 MPa, minimising the "
+    "displacement until the von Mises stress reaches 245 MPa, minimising the "
     "number of simulations."
 )
 query = st.text_area("Enter your query:", default_query)
@@ -137,9 +141,9 @@ if st.button("Submit"):
                 st.markdown("----")
 
 # ---------- full-trace evaluation ----------
-st.subheader("Tool-calling Evaluation")
-if st.button("Evaluate last run"):
-    with st.spinner("Grading tool use…"):
+st.subheader("Evaluation Metrics")
+if st.button("Reasoning Eval"):
+    with st.spinner("Reasoning Eval"):
         client = px.Client()
 
         # 1️⃣ pull only the LLM spans that issued a tool call
@@ -147,71 +151,34 @@ if st.button("Evaluate last run"):
             SpanQuery()
             .where("span_kind == 'LLM'")
             .select(
+                start_time="start_time",
                 question="input.value",
                 output_messages="llm.output_messages",
             )
         )
-        df = client.query_spans(q).dropna(subset=["output_messages"])
+        df = client.query_spans(q).dropna(subset=["output_messages"]).sort_values("start_time").tail(3)
 
         if df.empty:
             st.info("No tool-calling LLM spans found in the latest trace.")
             st.stop()
 
-        ACTION_RE  = re.compile(r"Action:\s*([A-Za-z0-9_]+)")
-        INPUT_RE   = re.compile(r"Action Input:\s*(\{.*\})", re.S)
+        
 
-        def first_call(messages):
-            """
-            Return (tool_name, json_args) from the first assistant message that
-            contains either a structured tool_call OR a ReAct-style “Action:” line.
-            """
-            for m in messages:
-                msg = m.get("message", m)                  # tolerate either shape
-                if msg.get("role") != "assistant":
-                    continue
-
-                # ① open-AI structured calls (not present in your trace but keep it)
-                tc = msg.get("tool_calls", [])
-                if tc:
-                    fn   = tc[0]["function"]
-                    args = fn["arguments"]
-                    if not isinstance(args, str):
-                        args = json.dumps(args)
-                    return fn["name"], args
-
-                # ② ReAct text block – parse Action / Action Input
-                content = msg.get("content", "")
-                m_action = ACTION_RE.search(content)
-                if m_action:
-                    name = m_action.group(1)
-                    m_args = INPUT_RE.search(content)
-                    args = m_args.group(1) if m_args else "{}"
-                    # round-trip through json so the grader sees valid JSON
-                    try:
-                        args = json.dumps(json.loads(args))
-                    except json.JSONDecodeError:
-                        args = "{}"
-                    return name, args
-
-            return None, None
-
-        df[["tool_name", "tool_args"]] = (
-            df["output_messages"].apply(lambda msgs: pd.Series(first_call(msgs)))
+        df[["tool_name", "tool_args"]] = df["output_messages"].apply(
+            lambda msgs: pd.Series(extract_action(msgs))
         )
 
         eval_df = pd.DataFrame(
             {
-                "question": df["question"],
-                "tool_call": df.apply(lambda r: f"{r.tool_name}({r.tool_args})", axis=1),
+                "question":        df["question"],
+                "tool_call":       df.apply(lambda r: f"{r.tool_name}({r.tool_args})", axis=1),
                 "tool_definitions": [tools] * len(df),
             },
             index=df.index,
         )
 
-        eval_df.drop(columns="tool_definitions").to_csv("eval_input.csv", index=False)
-
         # 2️⃣ run classifier (GPT-4o, temp-0)
-        judge = OpenAIModel(model=llm_type, temperature=0)
+        judge = OpenAIModel(model=llm_type_eval, temperature=0)
         rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
 
         graded = llm_classify(
@@ -240,8 +207,7 @@ if st.button("Evaluate last run"):
     )
 
 # ---------- parameter‑unit evaluation ----------
-st.subheader("Parameter-unit Evaluation")
-if st.button("Check parameter units"):
+if st.button("Tool Parameter Unit Eval"):
     with st.spinner("Checking units…"):
         client = px.Client()
 
@@ -250,12 +216,13 @@ if st.button("Check parameter units"):
             SpanQuery()
             .where("span_kind == 'TOOL'")
             .select(
+                start_time   = "start_time",
                 tool_name   = "tool.name",
                 tool_call   = "input.value",
                 tool_output = "output.value",
             )
         )
-        df_tool = client.query_spans(q)
+        df_tool = client.query_spans(q).sort_values("start_time").tail(3)
 
         if df_tool.empty:
             st.info("No TOOL spans found in the latest trace.")
@@ -280,7 +247,7 @@ if st.button("Check parameter units"):
             index=df_tool.index,
         ).dropna(subset=["tool_definition"])   # drop rows we failed to match
 
-        judge = OpenAIModel(model=llm_type, temperature=0)
+        judge = OpenAIModel(model=llm_type_eval, temperature=0)
         rails  = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
 
         graded = llm_classify(
@@ -304,3 +271,85 @@ if st.button("Check parameter units"):
         f"✅ {int(graded['score'].sum())}/{len(graded)} tool calls have correct units "
         "(now visible in Phoenix)"
     )
+# ---------- final-result evaluation ----------
+if st.button("Hallucination Eval"):
+    with st.spinner("Hallucination Eval"):
+        client = px.Client()
+
+        q = (
+            SpanQuery()
+            .where("span_kind == 'AGENT'" and "name == 'ReActAgentWorker.run_step'")
+            .select(
+                start_time   = "start_time",
+                memory   = "input.value",
+                answer = "output.value",
+            )
+        )
+        df_agent = client.query_spans(q).sort_values("start_time").tail(1)
+        judge = OpenAIModel(model=llm_type_eval, temperature=0)
+        rails_h = ["hallucinated", "not"]
+
+        graded_h = llm_classify(
+            data=df_agent,
+            template=FINAL_HALLUCINATION_PROMPT_TEMPLATE,
+            rails=rails_h,
+            model=judge,
+            provide_explanation=True,
+        )
+        graded_h["score"] = (graded_h["label"] == "hallucinated").astype(float)
+        graded_h.index.name = "span_id"
+        client.log_evaluations(
+            SpanEvaluations(
+                eval_name="Hallucination Eval",
+                dataframe=graded_h,
+            )
+        )
+
+    # quick Streamlit summary
+    st.success(
+        "✅ Final answer marked correct (now visible in Phoenix)"
+        if graded_h["score"].iloc[0] == 0
+        else "❌ Final answer marked incorrect (now visible in Phoenix)"
+    )
+
+if st.button("Beam Failure Eval"):
+    with st.spinner("Beam Failure Eval"):
+        client = px.Client()
+
+        # ── 1. pick the span to attach the metric to ──────────────────────────
+        latest_span_id = (
+            client.query_spans(
+                SpanQuery()
+                .where("span_kind == 'AGENT' and name == 'ReActAgentWorker.run_step'")
+                .select() 
+            )
+            .sort_values("start_time")
+            .index[-1]  
+        )
+
+        # ── 2. deterministic stress check ─────────────────────────────────────
+        stress_val = parse_stress_mpa()
+        exceeds = stress_val is not None and stress_val > 260.0
+
+        graded_h = pd.DataFrame(
+            {
+                "label": ["exceeded" if exceeds else "not"],
+                "score": [float(exceeds)],
+            },
+            index=[latest_span_id], 
+        )
+        graded_h.index.name = "span_id"
+
+        # ── 3. write evaluation to Phoenix ────────────────────────────────────
+        client.log_evaluations(
+            SpanEvaluations(
+                eval_name="Stress threshold >260 MPa",
+                dataframe=graded_h,
+            )
+        )
+
+    st.success(
+        "✅ Stress exceeded 260 MPa" if exceeds
+        else "✅ Stress did not exceed 260 MPa"
+    )
+

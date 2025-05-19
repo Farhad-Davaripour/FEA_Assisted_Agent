@@ -108,3 +108,18 @@ Answer with a single word — "correct" or "incorrect" — and nothing else.
 
     [Tool Definition]: {tool_definition}
 """
+
+FINAL_HALLUCINATION_PROMPT_TEMPLATE = """
+You are an evaluation assistant verifying whether the final answer introduces
+information that is not supported by the reasoning steps provided.
+
+    [BEGIN DATA]
+    ************
+    [Reasoning Steps]: {memory}
+    ************
+    [Final Answer]: {answer}
+    [END DATA]
+
+Respond with a single word — "hallucinated" if unsupported information is
+present or "not" if the answer is grounded in the reasoning steps.
+"""

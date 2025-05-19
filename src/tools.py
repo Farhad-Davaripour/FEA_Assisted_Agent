@@ -1,6 +1,8 @@
 import os
 import subprocess
 import shutil
+import re
+import json
 
 def generate_input_file(applied_displacement):
     """
@@ -125,7 +127,7 @@ def extract_von_mises_stress_from_ODB():
         result = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         print("Von-Mises stress data extracted successfully.")
         
-        data = round(float(result.stdout.split("is ")[1].strip())/10e6,2)
+        data = round(float(result.stdout.split("is ")[1].strip())/1e6,2)
 
         # Check if the target file exists
         source_file = os.path.join(os.getcwd(), "max_vm_stress.txt")
@@ -143,3 +145,50 @@ def extract_von_mises_stress_from_ODB():
         print("Error output:", e.stderr)
     
     return f"von_mises stress is {data} MPa"
+
+def parse_stress_mpa(path="src/abaqus_files/max_vm_stress.txt"):
+    """Return the stress value in MPa if file exists, else None."""
+    try:
+        with open(path) as f:
+            text = f.read()
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+        if not m:
+            return None
+        value = float(m.group(1))
+        if value > 1000:
+            value /= 1e6
+        return value
+    except OSError:
+        return None
+    
+ACTION_RE = re.compile(r"Action:\s*([A-Za-z0-9_]+)")
+INPUT_RE  = re.compile(r"Action Input:\s*(\{.*\})", re.S)
+
+def extract_action(messages):
+    """
+    Return (tool_name, json_args) from the first assistant message
+    that contains an “Action:” line.
+    """
+    for m in messages:                                 # each element in output_messages
+        msg = m.get("message", m)                      # tolerate either shape
+        if msg.get("role") != "assistant":
+            continue
+
+        content = msg.get("content", "")
+        m_action = ACTION_RE.search(content)
+        if not m_action:
+            continue
+
+        name = m_action.group(1)
+        m_args = INPUT_RE.search(content)
+        args  = m_args.group(1) if m_args else "{}"
+
+        # round-trip through json so the grader sees valid JSON
+        try:
+            args = json.dumps(json.loads(args))
+        except json.JSONDecodeError:
+            args = "{}"
+
+        return name, args
+
+    return None, "{}" 
