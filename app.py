@@ -52,6 +52,9 @@ llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4.1"])
 llm_type_eval = st.sidebar.selectbox(
     "Select LLM type (judge)", ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"]
 )
+llm_type_eval_high = st.sidebar.selectbox(
+    "Select LLM type (judge high reasoning)", ["gpt-4.1"]
+)
 
 # ---------- tools ---------- #
 abaqus_input_file_tool = FunctionTool.from_defaults(
@@ -130,8 +133,8 @@ if st.button("Submit"):
         st.subheader("Final Answer:")
         st.markdown(final_answer)
 
-        st.subheader("Reasoning:")
-        with st.expander("Show Reasoning"):
+        st.subheader("Intermediate Reasoning and Acting Steps:")
+        with st.expander("Show the Steps"):
             with suppress_tracing():
                 completed = agent.get_completed_tasks()[-1]
 
@@ -146,7 +149,7 @@ if st.button("Submit"):
 # -------------- evaluation helpers -------------- #
 
 def reasoning_eval():
-    judge = OpenAIModel(model=llm_type_eval, temperature=0)
+    judge = OpenAIModel(model=llm_type_eval_high, temperature=0)
     rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
     return run_eval(
         span_kind="LLM",
@@ -172,8 +175,8 @@ def reasoning_eval():
             },
             index=df.index,
         ),
+        retries=2,
     )
-
 
 def unit_eval():
     judge = OpenAIModel(model=llm_type_eval, temperature=0)
@@ -204,8 +207,8 @@ def unit_eval():
             },
             index=df.index,
         ).dropna(subset=["tool_definition"]),
+        retries=2,
     )
-
 
 def hallucination_eval():
     judge = OpenAIModel(model=llm_type_eval, temperature=0)
@@ -222,9 +225,11 @@ def hallucination_eval():
         eval_name="Hallucination",
         post_process=lambda df: df.tail(1),
         num_steps=1,
+        retries=2,
     )
 
 # -------------- Streamlit buttons -------------- #
+st.subheader("Offline Evaluation")
 if st.button("Reasoning Eval"):
     graded = reasoning_eval()
     if graded.empty:

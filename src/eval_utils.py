@@ -27,32 +27,40 @@ def run_eval(
     judge,
     eval_name: str,
     num_steps: int = 3,
+    retries: int = 0,                 # 👈 NEW
 ) -> pd.DataFrame:
-    """Collect spans, grade them with an LLM, push scores to Phoenix, and return the result."""
+    """Grade spans with an LLM, retrying up to `retries` extra times if not all pass."""
     client = px.Client()
-
-    q = SpanQuery().where(f"span_kind == '{span_kind}'").select(**select)
-    df = client.query_spans(q).sort_values("start_time").tail(num_steps)
+    df = (
+        client.query_spans(
+            SpanQuery().where(f"span_kind == '{span_kind}'").select(**select)
+        )
+        .sort_values("start_time")
+        .tail(num_steps)
+    )
 
     if df.empty:
-        return pd.DataFrame()  # caller can handle empty case
+        return pd.DataFrame()
 
-    graded = llm_classify(
-        data=post_process(df),
-        template=template,
-        rails=rails,
-        model=judge,
-        provide_explanation=True,
-    )
-    # first rail is the "correct" one
-    graded["score"] = (graded["label"] == rails[0]).astype(float)
-    graded.index.name = "span_id"
-
-    client.log_evaluations(
-        SpanEvaluations(
-            eval_name=eval_name,
-            dataframe=graded,
+    # ------- retry loop ---------------------------------------------------
+    graded = None
+    for _ in range(retries + 1):                      # first try + N retries
+        graded = llm_classify(
+            data=post_process(df),
+            template=template,
+            rails=rails,
+            model=judge,
+            provide_explanation=True,
+            run_sync=True,
         )
+        graded["score"] = (graded["label"] == rails[0]).astype(float)
+        if graded["score"].sum() == len(graded):      # all correct → stop
+            break
+    # ---------------------------------------------------------------------
+
+    graded.index.name = "span_id"
+    client.log_evaluations(
+        SpanEvaluations(eval_name=eval_name, dataframe=graded)
     )
     return graded
 
