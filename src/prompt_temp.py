@@ -17,7 +17,7 @@ You MUST obey the function signature of each tool. Do NOT pass in no arguments i
 Always return the math equations and terms within he math equations in LATEX markdown (between $$).
 When executing a tool if the argument is not provided within the query, then assume a reasonable default value for the argument.
 If you are asked to do parametric studies or sensitivity analysis, you should complete one cycle completely and extract the desired information (e.g., von-mises stress) before moving to the next cycle.
-In parametric studies or sensitivity studies, do not run several jobs in parallel 
+In parametric studies or sensitivity studies, do not run several jobs in parallel.
 
 ## Tools
 You have access to a wide variety of tools. You are responsible for using

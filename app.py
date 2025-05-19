@@ -36,7 +36,7 @@ import pandas as pd
 # -------------------------------------------- #
 
 load_dotenv(override=True)
-
+stress_threshold = os.getenv("STRESS_THRESHOLD", 350.0)
 # ---------- observability (run once) ---------- #
 @st.cache_resource(show_spinner=False)
 def init_observability():
@@ -105,8 +105,8 @@ st.image(logo_file_path, width=500)
 default_query = (
     "For the cantilever beam, retrieve the maximum von Mises stress when the "
     "pipe is displaced downward by 0.02 m. Then incrementally increase the "
-    "displacement until the von Mises stress reaches 245 MPa, minimising the "
-    "number of simulations."
+    f"displacement until the von Mises stress reaches approximately {stress_threshold} MPa, minimising the "
+    "number of simulations. Do not increase the displacement by more than double in each step"
 )
 query = st.text_area("Enter your query:", default_query)
 
@@ -195,7 +195,7 @@ if st.button("Reasoning Eval"):
         # 3️⃣ write scores back to Phoenix
         client.log_evaluations(
             SpanEvaluations(
-                eval_name="Function-call correctness",
+                eval_name="Reasoning",
                 dataframe=graded,
             )
         )
@@ -262,7 +262,7 @@ if st.button("Tool Parameter Unit Eval"):
 
         client.log_evaluations(
             SpanEvaluations(
-                eval_name="Parameter-unit correctness",
+                eval_name="Unit Check",
                 dataframe=graded,
             )
         )
@@ -300,7 +300,7 @@ if st.button("Hallucination Eval"):
         graded_h.index.name = "span_id"
         client.log_evaluations(
             SpanEvaluations(
-                eval_name="Hallucination Eval",
+                eval_name="Hallucination",
                 dataframe=graded_h,
             )
         )
@@ -329,7 +329,7 @@ if st.button("Beam Failure Eval"):
 
         # ── 2. deterministic stress check ─────────────────────────────────────
         stress_val = parse_stress_mpa()
-        exceeds = stress_val is not None and stress_val > 260.0
+        exceeds = stress_val is not None and stress_val > f"{stress_threshold}"
 
         graded_h = pd.DataFrame(
             {
@@ -343,13 +343,13 @@ if st.button("Beam Failure Eval"):
         # ── 3. write evaluation to Phoenix ────────────────────────────────────
         client.log_evaluations(
             SpanEvaluations(
-                eval_name="Stress threshold >260 MPa",
+                eval_name=f"Stress Thresh",
                 dataframe=graded_h,
             )
         )
 
     st.success(
-        "✅ Stress exceeded 260 MPa" if exceeds
-        else "✅ Stress did not exceed 260 MPa"
+        f"✅ Stress exceeded {stress_threshold} MPa" if exceeds
+        else f"✅ Stress did not exceed {stress_threshold} MPa"
     )
 
