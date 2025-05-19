@@ -29,26 +29,35 @@ The **FEA Assisted Agent** is an AI-powered tool designed to automate Abaqus-bas
 ---
 
 ## Workflow
-
-1. **User Query Input:**
-   - Users can enter specific simulation tasks via a prompt (e.g., determine maximum Von-Mises stress for a specific displacement).
-
-2. **Task Automation:**
-   - The assistant processes the query, executes the corresponding steps, and organizes the outputs.
-
-3. **Real-time Updates:**
-   - Progress is displayed interactively, showing step-by-step reasoning and actions.
-
-4. **Final Results:**
-   - Outputs and reasoning are summarized for the user.
-
----
-
-## Technologies Used
-
-### Libraries and Modules
-- **Streamlit:** User interface for seamless interaction.
-- **Llama Index:** Framework for integrating tools and executing workflows via a ReAct-based agent.
-- **Custom Modules:** 
-  - `tools` for Abaqus integration.
-  - `prompt_temp` for system prompt management.
+ 
+ 1. **User Query Input:**
+    - Users can enter specific simulation tasks via a prompt (e.g., determine maximum Von-Mises stress for a specific displacement).
+ 
+ 2. **Task Automation:**
+    - The assistant processes the query, executes the corresponding steps, and organizes the outputs.
+ 
+ 3. **Real-time Updates:**
+    - Progress is displayed interactively, showing step-by-step reasoning and actions.
+ 
+ 4. **Final Results:**
+    - Outputs and reasoning are summarized for the user.
+ 
+ ---
+ 
+ ## Technologies Used
+ 
+ ### Libraries and Modules
+ - **Streamlit:** User interface for seamless interaction.
+ - **Llama Index:** Framework for integrating tools and executing workflows via a ReAct-based agent.
+-- **Custom Modules:** 
++- **Custom Modules:**
+   - `tools` for Abaqus integration.
+-  - `prompt_temp` for system prompt management.
++  - `prompt_temp` for system prompt management.
++ - **Phoenix Evaluations:** Used to grade tool usage and final answers with LLM judges.
++
++### Evaluation Features
++The application provides built-in evaluation buttons to analyse recent runs:
++
++1. **Tool-calling and Unit Evaluation** – Grades tool selection and unit usage.
++2. **Final Result Evaluation** – Checks for hallucination, adherence to the original query and verifies if the computed stress exceeds 105&nbsp;MPa.
