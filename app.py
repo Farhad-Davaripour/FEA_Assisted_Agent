@@ -1,4 +1,3 @@
-# ================== Setup ================== #
 import os, json, re, streamlit as st
 from dotenv import load_dotenv
 
@@ -17,41 +16,43 @@ from src.tools import (
     run_abaqus,
     extract_von_mises_stress_from_ODB,
     parse_stress_mpa,
-    extract_action
+    extract_action,
 )
 from src.prompt_temp import (
     react_system_prompt as RA_SYSTEM_PROMPT,
     TOOL_CALLING_PROMPT_TEMPLATE,
     TOOL_UNIT_PROMPT_TEMPLATE,
-    FINAL_HALLUCINATION_PROMPT_TEMPLATE
+    FINAL_HALLUCINATION_PROMPT_TEMPLATE,
 )
 from phoenix.evals import (
     TOOL_CALLING_PROMPT_RAILS_MAP,
-    llm_classify,
     OpenAIModel,
 )
 import pandas as pd
 
-
-# -------------------------------------------- #
+from src.eval_utils import run_eval
 
 load_dotenv(override=True)
-stress_threshold = os.getenv("STRESS_THRESHOLD", 350.0)
+stress_threshold = float(os.getenv("STRESS_THRESHOLD", 350.0))
+
 # ---------- observability (run once) ---------- #
 @st.cache_resource(show_spinner=False)
 def init_observability():
     tp = register(
         endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
         batch=True,
-        set_global_tracer_provider=False
+        set_global_tracer_provider=False,
     )
     LlamaIndexInstrumentor().instrument(skip_dep_check=True, tracer_provider=tp)
     return px.launch_app()
+
 session = init_observability()
 
 # ---------- LLM picker ---------- #
 llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4.1"])
-llm_type_eval = st.sidebar.selectbox("Select LLM type", ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"])
+llm_type_eval = st.sidebar.selectbox(
+    "Select LLM type (judge)", ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"]
+)
 
 # ---------- tools ---------- #
 abaqus_input_file_tool = FunctionTool.from_defaults(
@@ -64,26 +65,27 @@ abaqus_job_execution_tool = FunctionTool.from_defaults(
     name="Abaqus_job_executor",
     description="Runs an Abaqus job with `cantilever_beam.inp` and collects outputs.",
 )
+
 von_mises_stress_extraction_tool = FunctionTool.from_defaults(
     fn=extract_von_mises_stress_from_ODB,
     name="Von_Mises_stress_extractor",
     description="Extracts max Von-Mises stress from the ODB file (returns MPa).",
 )
+
 tools = [
     abaqus_input_file_tool,
     abaqus_job_execution_tool,
     von_mises_stress_extraction_tool,
 ]
+
 # ---------- init agent (once) ---------- #
 if "agent" not in st.session_state:
     llm = llma_OpenAI(model=llm_type)
     st.session_state.agent = ReActAgent.from_tools(
         tools, llm=llm, verbose=True, max_iterations=100
     )
-    with suppress_tracing():  # silence bookkeeping spans
-        st.session_state.agent.update_prompts(
-            {"agent_worker:system_prompt": RA_SYSTEM_PROMPT()}
-        )
+    with suppress_tracing():
+        st.session_state.agent.update_prompts({"agent_worker:system_prompt": RA_SYSTEM_PROMPT()})
 
 agent = st.session_state.agent
 
@@ -139,178 +141,107 @@ if st.button("Submit"):
                             unsafe_allow_html=True,
                         )
                 st.markdown("----")
+# -------------- evaluation helpers -------------- #
 
-# ---------- full-trace evaluation ----------
-st.subheader("Evaluation Metrics")
-if st.button("Reasoning Eval"):
-    with st.spinner("Reasoning Eval"):
-        client = px.Client()
-
-        # 1️⃣ pull only the LLM spans that issued a tool call
-        q = (
-            SpanQuery()
-            .where("span_kind == 'LLM'")
-            .select(
-                start_time="start_time",
-                question="input.value",
-                output_messages="llm.output_messages",
-            )
-        )
-        df = client.query_spans(q).dropna(subset=["output_messages"]).sort_values("start_time").tail(3)
-
-        if df.empty:
-            st.info("No tool-calling LLM spans found in the latest trace.")
-            st.stop()
-
-        
-
-        df[["tool_name", "tool_args"]] = df["output_messages"].apply(
-            lambda msgs: pd.Series(extract_action(msgs))
-        )
-
-        eval_df = pd.DataFrame(
+def reasoning_eval():
+    judge = OpenAIModel(model=llm_type_eval, temperature=0)
+    rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
+    return run_eval(
+        span_kind="LLM",
+        select=dict(
+            start_time="start_time",
+            question="input.value",
+            output_messages="llm.output_messages",
+        ),
+        template=TOOL_CALLING_PROMPT_TEMPLATE,
+        rails=rails,
+        judge=judge,
+        eval_name="Reasoning",
+        post_process=lambda df: pd.DataFrame(
             {
-                "question":        df["question"],
-                "tool_call":       df.apply(lambda r: f"{r.tool_name}({r.tool_args})", axis=1),
+                "question": df["question"],
+                "tool_call": df.apply(
+                    lambda r: (
+                        lambda tool, args: f"{tool}({args})"
+                    )(*extract_action(r.output_messages)),
+                    axis=1,
+                ),
                 "tool_definitions": [tools] * len(df),
             },
             index=df.index,
-        )
-
-        # 2️⃣ run classifier (GPT-4o, temp-0)
-        judge = OpenAIModel(model=llm_type_eval, temperature=0)
-        rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
-
-        graded = llm_classify(
-            data=eval_df,
-            template=TOOL_CALLING_PROMPT_TEMPLATE,
-            rails=rails,
-            model=judge,
-            provide_explanation=True,
-        )
-
-        graded["score"] = (graded["label"] == "correct").astype(float)
-        graded.index.name = "span_id"   # Phoenix expects this
-
-        # 3️⃣ write scores back to Phoenix
-        client.log_evaluations(
-            SpanEvaluations(
-                eval_name="Reasoning",
-                dataframe=graded,
-            )
-        )
-
-    # quick Streamlit summary
-    st.success(
-        f"✅ {int(graded['score'].sum())}/{len(graded)} calls marked correct "
-        "(now visible in Phoenix)"
+        ),
     )
 
-# ---------- parameter‑unit evaluation ----------
-if st.button("Tool Parameter Unit Eval"):
-    with st.spinner("Checking units…"):
-        client = px.Client()
 
-        #  collect every TOOL span (one row per actual tool call)
-        q = (
-            SpanQuery()
-            .where("span_kind == 'TOOL'")
-            .select(
-                start_time   = "start_time",
-                tool_name   = "tool.name",
-                tool_call   = "input.value",
-                tool_output = "output.value",
-            )
+def unit_eval():
+    judge = OpenAIModel(model=llm_type_eval, temperature=0)
+    rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
+    tool_lookup = {
+        (getattr(t.metadata, "name", None) if hasattr(t, "metadata") else getattr(t, "name", None)): (
+            t.metadata.description if hasattr(t, "metadata") else ""
         )
-        df_tool = client.query_spans(q).sort_values("start_time").tail(3)
-
-        if df_tool.empty:
-            st.info("No TOOL spans found in the latest trace.")
-            st.stop()
-
-        # --- robust mapping <tool‑name → FunctionTool object> -------------
-        tool_lookup = {}
-        for t in tools:
-            try:
-                tool_lookup[t.metadata.name] = t.metadata.description        # modern attribute
-            except AttributeError:
-                # very old FunctionTool (<0.9) had .name
-                tool_lookup[getattr(t, "name", None)] = t.metadata.description
-        # ---------------------------------------------------------------------
-
-        eval_df = pd.DataFrame(
+        for t in tools
+    }
+    return run_eval(
+        span_kind="TOOL",
+        select=dict(
+            start_time="start_time",
+            tool_name="tool.name",
+            tool_call="input.value",
+            tool_output="output.value",
+        ),
+        template=TOOL_UNIT_PROMPT_TEMPLATE,
+        rails=rails,
+        judge=judge,
+        eval_name="Unit Check",
+        post_process=lambda df: pd.DataFrame(
             {
-                "tool_call":   df_tool["tool_call"].astype(str),
-                "tool_output": df_tool["tool_output"].astype(str),
-                "tool_definition": df_tool["tool_name"].map(tool_lookup),
+                "tool_call": df["tool_call"].astype(str),
+                "tool_output": df["tool_output"].astype(str),
+                "tool_definition": df["tool_name"].map(tool_lookup),
             },
-            index=df_tool.index,
-        ).dropna(subset=["tool_definition"])   # drop rows we failed to match
-
-        judge = OpenAIModel(model=llm_type_eval, temperature=0)
-        rails  = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
-
-        graded = llm_classify(
-            data       = eval_df,
-            template   = TOOL_UNIT_PROMPT_TEMPLATE,
-            rails      = rails,
-            model      = judge,
-            provide_explanation = True,
-        )
-        graded["score"] = (graded["label"] == "correct").astype(float)
-        graded.index.name = "span_id"
-
-        client.log_evaluations(
-            SpanEvaluations(
-                eval_name="Unit Check",
-                dataframe=graded,
-            )
-        )
-
-    st.success(
-        f"✅ {int(graded['score'].sum())}/{len(graded)} tool calls have correct units "
-        "(now visible in Phoenix)"
+            index=df.index,
+        ).dropna(subset=["tool_definition"]),
     )
-# ---------- final-result evaluation ----------
+
+
+def hallucination_eval():
+    judge = OpenAIModel(model=llm_type_eval, temperature=0)
+    return run_eval(
+        span_kind="AGENT",
+        select=dict(
+            start_time="start_time",
+            memory="input.value",
+            answer="output.value",
+        ),
+        template=FINAL_HALLUCINATION_PROMPT_TEMPLATE,
+        rails=["not", "hallucinated"],  # "not" is the correct label
+        judge=judge,
+        eval_name="Hallucination",
+        post_process=lambda df: df.tail(1),
+    )
+
+# -------------- Streamlit buttons -------------- #
+if st.button("Reasoning Eval"):
+    graded = reasoning_eval()
+    if graded.empty:
+        st.info("No tool‑calling LLM spans found in the latest trace.")
+    else:
+        st.success(f"✅ {int(graded['score'].sum())}/{len(graded)} calls marked correct")
+
+if st.button("Tool Parameter Unit Eval"):
+    graded = unit_eval()
+    if graded.empty:
+        st.info("No TOOL spans found in the latest trace.")
+    else:
+        st.success(f"✅ {int(graded['score'].sum())}/{len(graded)} tool calls have correct units")
+
 if st.button("Hallucination Eval"):
-    with st.spinner("Hallucination Eval"):
-        client = px.Client()
-
-        q = (
-            SpanQuery()
-            .where("span_kind == 'AGENT'" and "name == 'ReActAgentWorker.run_step'")
-            .select(
-                start_time   = "start_time",
-                memory   = "input.value",
-                answer = "output.value",
-            )
-        )
-        df_agent = client.query_spans(q).sort_values("start_time").tail(1)
-        judge = OpenAIModel(model=llm_type_eval, temperature=0)
-        rails_h = ["hallucinated", "not"]
-
-        graded_h = llm_classify(
-            data=df_agent,
-            template=FINAL_HALLUCINATION_PROMPT_TEMPLATE,
-            rails=rails_h,
-            model=judge,
-            provide_explanation=True,
-        )
-        graded_h["score"] = (graded_h["label"] == "hallucinated").astype(float)
-        graded_h.index.name = "span_id"
-        client.log_evaluations(
-            SpanEvaluations(
-                eval_name="Hallucination",
-                dataframe=graded_h,
-            )
-        )
-
-    # quick Streamlit summary
-    st.success(
-        "✅ Final answer marked correct (now visible in Phoenix)"
-        if graded_h["score"].iloc[0] == 0
-        else "❌ Final answer marked incorrect (now visible in Phoenix)"
-    )
+    graded = hallucination_eval()
+    if graded.empty:
+        st.info("No agent spans found in the latest trace.")
+    else:
+        st.success("✅ Final answer marked correct" if graded["score"].iloc[0] == 1 else "❌ Final answer marked incorrect")
 
 if st.button("Beam Failure Eval"):
     with st.spinner("Beam Failure Eval"):
@@ -329,7 +260,7 @@ if st.button("Beam Failure Eval"):
 
         # ── 2. deterministic stress check ─────────────────────────────────────
         stress_val = parse_stress_mpa()
-        exceeds = stress_val is not None and stress_val > f"{stress_threshold}"
+        exceeds = stress_val is not None and stress_val > stress_threshold
 
         graded_h = pd.DataFrame(
             {
@@ -352,4 +283,3 @@ if st.button("Beam Failure Eval"):
         f"✅ Stress exceeded {stress_threshold} MPa" if exceeds
         else f"✅ Stress did not exceed {stress_threshold} MPa"
     )
-
