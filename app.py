@@ -32,7 +32,7 @@ import pandas as pd
 from src.eval_utils import run_eval, log_stress_eval_real_time
 
 load_dotenv(override=True)
-stress_threshold = float(os.getenv("STRESS_THRESHOLD", 350.0))
+stress_threshold = float(os.getenv("STRESS_THRESHOLD", 360.0))
 
 # ---------- observability (run once) ---------- #
 @st.cache_resource(show_spinner=False)
@@ -110,7 +110,7 @@ default_query = (
     "For the cantilever beam, retrieve the maximum von Mises stress when the "
     "pipe is displaced downward by 0.02 m. Then incrementally increase the "
     f"displacement until the von Mises stress reaches approximately {stress_threshold} MPa, minimising the "
-    "number of simulations. Ensure you never pass the threshold during your trials."
+    "number of simulations."
 )
 query = st.text_area("Enter your query:", default_query)
 
@@ -148,7 +148,7 @@ if st.button("Submit"):
                 st.markdown("----")
 # -------------- evaluation helpers -------------- #
 
-def reasoning_eval():
+def tool_utilization_eval():
     judge = OpenAIModel(model=llm_type_eval_high, temperature=0)
     rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
     return run_eval(
@@ -161,7 +161,7 @@ def reasoning_eval():
         template=TOOL_CALLING_PROMPT_TEMPLATE,
         rails=rails,
         judge=judge,
-        eval_name="Reasoning",
+        eval_name="Tool Utilization",
         post_process=lambda df: pd.DataFrame(
             {
                 "question": df["question"],
@@ -220,7 +220,7 @@ def hallucination_eval():
             answer="output.value",
         ),
         template=FINAL_HALLUCINATION_PROMPT_TEMPLATE,
-        rails=["not", "hallucinated"],  # "not" is the correct label
+        rails=["hallucinated", "not"],
         judge=judge,
         eval_name="Hallucination",
         post_process=lambda df: df.tail(1),
@@ -230,23 +230,22 @@ def hallucination_eval():
 
 # -------------- Streamlit buttons -------------- #
 st.subheader("Offline Evaluation")
-if st.button("Reasoning Eval"):
-    graded = reasoning_eval()
+if st.button("Planning Correctness: Hallucination Eval"):
+    graded = hallucination_eval()
+    if graded.empty:
+        st.info("No agent spans found in the latest trace.")
+    else:
+        st.success("✅ Final answer marked correct" if graded["score"].iloc[0] == 0 else "❌ Final answer marked incorrect")
+if st.button("Tool Utilization: Tool Mapping"):
+    graded = tool_utilization_eval()
     if graded.empty:
         st.info("No tool‑calling LLM spans found in the latest trace.")
     else:
         st.success(f"✅ {int(graded['score'].sum())}/{len(graded)} calls marked correct")
 
-if st.button("Tool Parameter Unit Eval"):
+if st.button("Tool Utilization: Unit Correctness"):
     graded = unit_eval()
     if graded.empty:
         st.info("No TOOL spans found in the latest trace.")
     else:
         st.success(f"✅ {int(graded['score'].sum())}/{len(graded)} tool calls have correct units")
-
-if st.button("Hallucination Eval"):
-    graded = hallucination_eval()
-    if graded.empty:
-        st.info("No agent spans found in the latest trace.")
-    else:
-        st.success("✅ Final answer marked correct" if graded["score"].iloc[0] == 1 else "❌ Final answer marked incorrect")

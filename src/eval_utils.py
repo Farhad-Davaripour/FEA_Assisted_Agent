@@ -7,7 +7,7 @@ from phoenix.evals import llm_classify
 from phoenix.trace import SpanEvaluations
 from phoenix.trace.dsl import SpanQuery
 load_dotenv(override=True)
-stress_threshold = float(os.getenv("STRESS_THRESHOLD", 350.0))
+stress_threshold = float(os.getenv("STRESS_THRESHOLD", 360.0))
 
 import warnings
 warnings.filterwarnings(
