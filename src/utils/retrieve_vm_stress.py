@@ -1,24 +1,30 @@
+import sys
 from odbAccess import openOdb
 
-# Open the ODB file
-odb_path = 'src/abaqus_files/cantilever_beam.odb'
+
+def _resolve_odb_path():
+    # Abaqus forwards args as: script.py -- <arg1> ...
+    args = [arg for arg in sys.argv[1:] if arg != "--"]
+    if args:
+        return args[0]
+    return "src/abaqus_files/cantilever_beam.odb"
+
+
+odb_path = _resolve_odb_path()
 odb = openOdb(odb_path)
 
-# Access the stress field values at the last frame of Step-1
-stress_field_values = odb.steps['Step-1'].frames[-1].fieldOutputs['S'].values
+step_names = list(odb.steps.keys())
+if not step_names:
+    raise RuntimeError("No analysis steps found in ODB file.")
 
-# List to store Mises stress values
+last_step_name = step_names[-1]
+stress_field_values = odb.steps[last_step_name].frames[-1].fieldOutputs["S"].values
 vm_stress_list = [field_value.mises for field_value in stress_field_values]
-
-# Find the maximum Mises stress
 max_mises_stress = max(vm_stress_list)
 
-# Print the overall maximum Mises stress
-print('Maximum Mises stress in the cantilever beam is %f' % max_mises_stress)
+print("Maximum Mises stress in the model is %f" % max_mises_stress)
 
-# Write the maximum Mises stress to a text file
-with open('max_vm_stress.txt', 'w') as output_file:
-    output_file.write('Maximum Mises stress in the cantilever beam is %f\n' % max_mises_stress)
+with open("max_vm_stress.txt", "w") as output_file:
+    output_file.write("Maximum Mises stress in the model is %f\n" % max_mises_stress)
 
-# Close the ODB file
 odb.close()

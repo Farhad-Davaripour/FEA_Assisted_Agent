@@ -3,148 +3,144 @@ import subprocess
 import shutil
 import re
 import json
+from pathlib import Path
 
-def generate_input_file(applied_displacement):
+ABAQUS_FILES_DIR = Path("src/abaqus_files")
+LAST_JOB_FILE = ABAQUS_FILES_DIR / ".last_job_name"
+
+
+def _ensure_abaqus_dir():
+    ABAQUS_FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_inp_name(inp_file_name):
+    if not inp_file_name:
+        raise ValueError("`inp_file_name` is required.")
+    file_name = Path(inp_file_name).name
+    if not file_name.lower().endswith(".inp"):
+        raise ValueError("Input file must have `.inp` extension.")
+    return file_name
+
+
+def _resolve_latest_job_name():
+    if LAST_JOB_FILE.exists():
+        name = LAST_JOB_FILE.read_text(encoding="utf-8").strip()
+        if name:
+            return name
+    odb_files = sorted(
+        ABAQUS_FILES_DIR.glob("*.odb"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return odb_files[0].stem if odb_files else None
+
+
+def run_abaqus(inp_file_name=None):
     """
-    Generate an Abaqus input file with a specified pipe thickness.
-
-    This function runs an Abaqus script (`create_inp_file.py`) using the provided 
-    pipe thickness as an argument, generates the input file, and moves it to the 
-    designated directory.
+    Run Abaqus using a user-provided `.inp` file in `src/abaqus_files`.
 
     Args:
-        applied_displacement (float): The displacement that the pipe is pushed down which is to be used in the Abaqus model.
-
-    Process:
-        1. Constructs the command to execute the Abaqus script with the pipe thickness.
-        2. Runs the command using `subprocess.run`.
-        3. Moves the generated `.inp` file to the specified destination directory.
-
-    Raises:
-        subprocess.CalledProcessError: If the Abaqus command execution fails.
-
-    Side Effects:
-        - Moves the generated `cantilever_beam.inp` file to `src/abaqus_files/cantilever_beam.inp`.
-        - Prints success or error messages to the console.
-
-    Example:
-        generate_input_file(0.015)
+        inp_file_name (str): Name of the input file (e.g. `beam_case.inp`).
     """
-    command = f"abaqus cae noGUI=./src/utils/create_inp_file.py -- {applied_displacement}"
     try:
-        subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _ensure_abaqus_dir()
+        if not inp_file_name:
+            inp_candidates = sorted(p.name for p in ABAQUS_FILES_DIR.glob("*.inp"))
+            if len(inp_candidates) == 1:
+                inp_file_name = inp_candidates[0]
+            else:
+                return (
+                    "Please provide `inp_file_name` (for example `beam_case.inp`). "
+                    "Multiple or no `.inp` files were found."
+                )
+        inp_name = _normalize_inp_name(inp_file_name)
+    except ValueError as exc:
+        return f"Invalid input file: {exc}"
 
-        # Define the source and destination paths
-        source_path = 'cantilever_beam.inp'
-        destination_path = 'src/abaqus_files/cantilever_beam.inp'
+    inp_path = ABAQUS_FILES_DIR / inp_name
+    if not inp_path.exists():
+        return f"Input file not found: {inp_path}"
 
-        # Move the file
-        shutil.move(source_path, destination_path)
-        # print("File moved successfully.")
-
-    except subprocess.CalledProcessError as e:
-        print("Error during Abaqus job execution.")
-        print("Error output:", e.stderr)
-    
-    return f"Input file generated successfully."
-
-def run_abaqus():
-    """
-    Run the Abaqus job and move output files to the designated directory.
-
-    This function executes an Abaqus job using the input file `cantilever_beam.inp` 
-    located in the `src/abaqus_files` directory. Upon successful execution, it moves 
-    all generated files starting with `cantilever_beam` from the current working 
-    directory to the `src/abaqus_files` directory.
-
-    Process:
-        1. Constructs the command to run the Abaqus job with the specified input file.
-        2. Executes the command using `subprocess.run`.
-        3. Iterates through the current working directory to identify and move all 
-           files starting with `cantilever_beam` to the `src/abaqus_files` directory.
-
-    Raises:
-        subprocess.CalledProcessError: If the Abaqus job execution fails.
-
-    Side Effects:
-        - Moves all Abaqus-generated output files with names starting with 
-          `cantilever_beam` to the `src/abaqus_files` directory.
-        - Prints success or error messages to the console.
-
-    Example:
-        run_abaqus()
-    """
-    command = f"abaqus job=cantilever_beam input=src/abaqus_files/cantilever_beam.inp"
+    job_name = inp_path.stem
+    command = f'abaqus job="{job_name}" input="{inp_path}"'
     try:
-        subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        # Define the source directory
-        source_directory = os.getcwd()  # Assumes Abaqus outputs files in the current working directory
+        subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-        # Loop through files in the source directory
-        for file_name in os.listdir(source_directory):
-            source_path = os.path.join(source_directory, file_name)
-            if os.path.isfile(source_path) and file_name.startswith("cantilever_beam"):
-                target_path = os.path.join("src/abaqus_files", file_name)
-                shutil.move(source_path, target_path)
-                # print(f"Moved {file_name} to 'src/abaqus_files'")
-    except subprocess.CalledProcessError as e:
-        print("Error during Abaqus job execution.")
-        print("Error output:", e.stderr)
+        # Abaqus typically emits artifacts in the current working directory.
+        for file_path in Path.cwd().iterdir():
+            if file_path.is_file() and file_path.name.startswith(job_name):
+                target_path = ABAQUS_FILES_DIR / file_path.name
+                if target_path.exists():
+                    target_path.unlink()
+                shutil.move(str(file_path), str(target_path))
 
-    return f"Abaqus job completed successfully."
+        LAST_JOB_FILE.write_text(job_name, encoding="utf-8")
+        return (
+            f"Abaqus job completed successfully for `{inp_name}`. "
+            f"Job name: `{job_name}`."
+        )
+    except subprocess.CalledProcessError as exc:
+        return f"Abaqus job failed for `{inp_name}`. Error: {exc.stderr}"
 
-def extract_von_mises_stress_from_ODB():
+
+def extract_von_mises_stress_from_ODB(job_name=None):
     """
-    Extract Von-Mises stress data from the Abaqus ODB file.
+    Extract max Von-Mises stress from an ODB file produced by Abaqus.
 
-    This function runs a Python script (`retrieve_vm_stress.py`) using Abaqus to 
-    extract Von-Mises stress data. The extracted data is saved in a file named 
-    `max_vm_stress.txt`. If the file is generated successfully, it is moved to 
-    the `src/abaqus_files` directory.
-
-    Process:
-        1. Executes the `retrieve_vm_stress.py` script using the Abaqus Python command.
-        2. Checks if the `max_vm_stress.txt` file exists in the current working directory.
-        3. Moves the file to the `src/abaqus_files` directory.
-        4. Ensures the target directory exists before moving the file.
-
-    Returns:
-        str: The standard output from the script execution, containing any logs or results.
-
-    Raises:
-        subprocess.CalledProcessError: If the Abaqus Python script execution fails.
-
-    Side Effects:
-        - Moves the `max_vm_stress.txt` file to the `src/abaqus_files` directory if it exists.
-        - Prints success or error messages to the console.
-
-    Example:
-        stress_data = extract_von_mises_stress_from_ODB()
+    Args:
+        job_name (str, optional): Abaqus job name (without `.odb`).
+            If omitted, the last successful run is used.
     """
-    command = f"abaqus python src/utils/retrieve_vm_stress.py"
+    _ensure_abaqus_dir()
+    resolved_job_name = (job_name or "").strip() or _resolve_latest_job_name()
+    if not resolved_job_name:
+        return "No ODB found. Run an Abaqus job first or pass `job_name` explicitly."
+
+    odb_path = ABAQUS_FILES_DIR / f"{resolved_job_name}.odb"
+    if not odb_path.exists():
+        return f"ODB file not found: {odb_path}"
+
+    command = f'abaqus python src/utils/retrieve_vm_stress.py -- "{odb_path}"'
     try:
-        result = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        print("Von-Mises stress data extracted successfully.")
-        
-        data = round(float(result.stdout.split("is ")[1].strip())/1e6,2)
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-        # Check if the target file exists
-        source_file = os.path.join(os.getcwd(), "max_vm_stress.txt")
-        if os.path.exists(source_file):
-            # Ensure the target directory exists
-            os.makedirs("src/abaqus_files", exist_ok=True)
+        output_text = result.stdout.strip()
+        match = re.search(r"is\s+([0-9]+(?:\.[0-9]+)?)", output_text)
+        if not match:
+            return f"Stress extraction completed but output could not be parsed: {output_text}"
 
-            # Move the file to the target directory
-            target_file = os.path.join("src/abaqus_files", "max_vm_stress.txt")
-            shutil.move(source_file, target_file)
-            # print(f"Moved {source_file} to {target_file}")
+        data = round(float(match.group(1)) / 1e6, 2)
 
-    except subprocess.CalledProcessError as e:
-        print("Error during Abaqus job execution.")
-        print("Error output:", e.stderr)
-    
-    return f"von_mises stress is {data} MPa"
+        source_file = Path.cwd() / "max_vm_stress.txt"
+        if source_file.exists():
+            target_file = ABAQUS_FILES_DIR / "max_vm_stress.txt"
+            if target_file.exists():
+                target_file.unlink()
+            shutil.move(str(source_file), str(target_file))
+
+            # Keep a job-specific copy for repeatability across runs.
+            job_target = ABAQUS_FILES_DIR / f"max_vm_stress_{resolved_job_name}.txt"
+            if job_target.exists():
+                job_target.unlink()
+            shutil.copy2(str(target_file), str(job_target))
+
+        return f"von_mises stress is {data} MPa"
+    except subprocess.CalledProcessError as exc:
+        return f"Stress extraction failed for `{resolved_job_name}`. Error: {exc.stderr}"
 
     
 ACTION_RE = re.compile(r"Action:\s*([A-Za-z0-9_]+)")

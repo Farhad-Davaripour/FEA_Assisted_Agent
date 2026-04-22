@@ -3,7 +3,11 @@ from dotenv import load_dotenv
 from typing import Callable, Dict, List
 import pandas as pd
 import phoenix as px
-from phoenix.evals import llm_classify
+from phoenix.evals import create_classifier, evaluate_dataframe
+try:
+    from phoenix.evals import llm_classify  # Older Phoenix API
+except ImportError:
+    llm_classify = None
 from phoenix.trace import SpanEvaluations
 from phoenix.trace.dsl import SpanQuery
 load_dotenv(override=True)
@@ -42,17 +46,50 @@ def run_eval(
     if df.empty:
         return pd.DataFrame()
 
+    eval_col_name = re.sub(r"[^a-zA-Z0-9_]+", "_", eval_name).strip("_").lower() or "eval"
+
+    def _classify_with_current_api(processed: pd.DataFrame) -> pd.DataFrame:
+        evaluator = create_classifier(
+            name=eval_col_name,
+            prompt_template=template,
+            llm=judge,
+            choices=rails,
+        )
+        evaluated = evaluate_dataframe(
+            dataframe=processed,
+            evaluators=[evaluator],
+            hide_tqdm_bar=True,
+        )
+        score_col = f"{eval_col_name}_score"
+        if score_col not in evaluated.columns:
+            return pd.DataFrame(index=processed.index)
+        raw = evaluated[score_col].apply(lambda x: x if isinstance(x, dict) else {})
+        return pd.DataFrame(
+            {
+                "label": raw.apply(lambda d: d.get("label")),
+                "score": raw.apply(lambda d: d.get("score")),
+                "explanation": raw.apply(lambda d: d.get("explanation")),
+            },
+            index=processed.index,
+        )
+
     # ------- retry loop ---------------------------------------------------
     graded = None
     for _ in range(retries + 1):                      # first try + N retries
-        graded = llm_classify(
-            data=post_process(df),
-            template=template,
-            rails=rails,
-            model=judge,
-            provide_explanation=True,
-            run_sync=True,
-        )
+        processed = post_process(df)
+        if llm_classify is not None:
+            graded = llm_classify(
+                data=processed,
+                template=template,
+                rails=rails,
+                model=judge,
+                provide_explanation=True,
+                run_sync=True,
+            )
+        else:
+            graded = _classify_with_current_api(processed)
+
+        # Phoenix v3 classifier may not return numeric score by default.
         graded["score"] = (graded["label"] == rails[0]).astype(float)
         if graded["score"].sum() == len(graded):      # all correct → stop
             break
@@ -89,7 +126,7 @@ def log_stress_eval_real_time(client):
     df_span = (
         client.query_spans(
             SpanQuery()
-            .where("span_kind == 'AGENT' and name == 'ReActAgentWorker.run_step'")
+            .where("span_kind == 'AGENT'")
             .select()
         )
         .sort_values("start_time")
