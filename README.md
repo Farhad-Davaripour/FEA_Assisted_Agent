@@ -1,49 +1,63 @@
 # Finite Element Analysis (FEA) Assisted Agent
 
 ## Overview
-The **FEA Assisted Agent** automates Abaqus finite element simulations. It leverages OpenAI models through **LlamaIndex** and presents a Streamlit interface for executing jobs, extracting stresses and running parametric studies. Phoenix provides tracing and evaluation capabilities so each run can be analysed in detail.
-
----
+The **FEA Assisted Agent** automates Abaqus finite element simulations. It uses OpenAI models through **LlamaIndex** and provides a Streamlit UI to execute jobs, extract stresses, and run parametric studies. Phoenix is used for tracing and evaluation.
 
 ## Features
+1. **User-Provided Input Files**: Upload/select your own Abaqus `.inp` files in the app.
+2. **Abaqus Job Executor**: Runs the simulation from the selected `.inp` and gathers outputs.
+3. **Von-Mises Stress Extractor**: Parses ODB output and stores peak stress in `max_vm_stress.txt`.
+4. **Repeatable Runs**: Reuse different `.inp` files without changing code.
+5. **Real-Time Stress Evaluation**: Logs whether stress exceeds `STRESS_THRESHOLD`.
 
-1. **Abaqus Input File Generator** – Creates parameterised `.inp` files and stores them under `src/abaqus_files`.
-2. **Abaqus Job Executor** – Runs the simulation and gathers all generated output files.
-3. **Von‑Mises Stress Extractor** – Parses the ODB file and records the peak stress value in `max_vm_stress.txt`.
-4. **Parametric Studies** – Uses a ReAct-based agent to automate multiple displacement trials.
-5. **Real-Time Stress Evaluation** – Logs whether the stress exceeds the `STRESS_THRESHOLD` during each step.
+## Environment Variables (`.env`)
+This project loads environment variables from a local `.env` file using `python-dotenv`.
 
----
+Create it from the template:
 
-## Workflow
-1. **User Query Input:** Submit a request describing the desired analysis.
-2. **Task Automation:** The agent selects tools and performs the simulation steps.
-3. **Real-time Updates:** Intermediate reasoning and outputs are shown while the job runs.
-4. **Final Results:** The agent summarises the outcome and recorded evaluations.
+```bash
+cp .env.example .env
+```
 
----
+Then set values:
 
-## Technologies Used
-- **Streamlit** for the user interface.
-- **LlamaIndex** for agent and tool integration.
-- **Phoenix** for tracing and grading tool calls and answers.
-- **OpenAI** models for both the agent and evaluation judges.
-- **Custom Modules:** `tools`, `prompt_temp`, and `eval_utils`.
+- `OPENAI_API_KEY` (required): API key used by the agent and eval judges.
+- `STRESS_THRESHOLD` (optional, default `360.0`): Stress target in MPa.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (optional): Phoenix/OTel collector endpoint (for example `localhost:4317`).
 
-### Evaluation Features
-- **Tool-Calling and Unit Evaluation** – Grades whether the chosen tool and units are correct.
-- **Final Result Evaluation** – Detects hallucination and checks if stress exceeds the configured threshold.
-- **Stress Threshold Logging** – Adds a metric to the latest agent step whenever a new stress value is produced.
+Example:
 
----
+```env
+OPENAI_API_KEY=sk-...
+STRESS_THRESHOLD=360.0
+OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
+```
 
-## Running the Application
-1. Install the requirements:
+## Setup and Run
+1. Create a virtual environment:
+   ```bash
+   python3 -m venv .venv
+   ```
+2. Activate it:
+   ```bash
+   source .venv/bin/activate
+   ```
+3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-2. Start the Streamlit app:
+4. Configure `.env` as described above.
+5. Start the app:
    ```bash
    streamlit run app.py
    ```
-   Set the `STRESS_THRESHOLD` environment variable if a different limit is desired.
+6. In the UI, upload/select an `.inp` file, then submit your query.
+
+## Notes
+- Streamlit may print telemetry information on startup. To disable usage stats:
+  - Add this to `~/.streamlit/config.toml`:
+    ```toml
+    [browser]
+    gatherUsageStats = false
+    ```
+- Phoenix may log optional warnings (for example Bedrock support). Those do not block normal OpenAI-based runs.
