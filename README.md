@@ -42,6 +42,8 @@ The completion check requires a successful Abaqus `.sta` status file, an ODB, an
 
 ## Local checks
 
+GitHub Actions runs these checks on Windows and Linux for each pull request.
+
 ```bash
 python -m unittest discover -s tests -v
 python -m pip check
