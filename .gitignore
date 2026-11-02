@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local env files
+.env
+
+# Virtual environment
+.venv/
+
+# User input files and Abaqus output
+src/abaqus_files/

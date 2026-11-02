@@ -1,0 +1,27 @@
+name: Local checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: ./.venv/bin/python
+          - os: windows-latest
+            python: .\.venv\Scripts\python.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m venv .venv
+      - run: ${{ matrix.python }} -m pip install -r requirements.txt
+      - run: ${{ matrix.python }} -m pip check
+      - run: ${{ matrix.python }} -m unittest discover -s tests -v
+      - run: ${{ matrix.python }} -m py_compile app.py src/tools.py src/eval_utils.py src/utils/retrieve_vm_stress.py src/utils/create_inp_file.py
