@@ -21,6 +21,20 @@ def _assistant_text(message):
     content = message.get("content")
     if isinstance(content, str):
         return content
+    # OpenInference's actual Responses trace uses nested ``contents`` entries
+    # rather than the ``content``/``blocks`` shapes emitted by other clients.
+    # Only accept text typed as such, and only after verifying assistant role.
+    contents = message.get("contents")
+    if isinstance(contents, list):
+        texts = []
+        for entry in contents:
+            if not isinstance(entry, dict):
+                continue
+            item = entry.get("message_content")
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                texts.append(item["text"])
+        if texts:
+            return "\n".join(texts)
     blocks = message.get("blocks")
     if isinstance(blocks, list):
         return "\n".join(block["text"] for block in blocks
