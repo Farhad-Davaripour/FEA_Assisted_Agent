@@ -62,7 +62,7 @@ def run_eval(
         )
         score_col = f"{eval_col_name}_score"
         if score_col not in evaluated.columns:
-            return pd.DataFrame(index=processed.index)
+            return pd.DataFrame()
         raw = evaluated[score_col].apply(lambda x: x if isinstance(x, dict) else {})
         return pd.DataFrame(
             {
@@ -90,38 +90,41 @@ def run_eval(
             graded = _classify_with_current_api(processed)
 
         # Phoenix v3 classifier may not return numeric score by default.
+        if graded.empty or "label" not in graded.columns:
+            continue
+        graded = graded[graded["label"].isin(rails)].copy()
+        if graded.empty:
+            continue
         graded["score"] = (graded["label"] == rails[0]).astype(float)
-        if graded["score"].sum() == len(graded):      # all correct → stop
-            break
+        break  # Never retry a valid result in search of a preferred answer.
     # ---------------------------------------------------------------------
 
+    if graded is None or graded.empty:
+        return pd.DataFrame()
     graded.index.name = "span_id"
     client.log_evaluations(
         SpanEvaluations(eval_name=eval_name, dataframe=graded)
     )
     return graded
 
-def parse_stress_mpa(path="src/abaqus_files/max_vm_stress.txt"):
-    """Return the stress value in MPa if file exists, else None."""
-    try:
-        with open(path) as f:
-            text = f.read()
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
-        if not m:
-            return None
-        value = float(m.group(1))
-        if value > 1000:
-            value /= 1e6
-        return value
-    except OSError:
-        return None
+def parse_stress_mpa(output):
+    """Parse only a tool result explicitly reported in MPa."""
+    match = re.fullmatch(
+        r"von_mises stress is\s+([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\s+MPa",
+        output.strip(),
+        flags=re.IGNORECASE,
+    )
+    return float(match.group(1)) if match else None
     
 # --- revised helper (same signature, no .order_by/.limit) -------------
-def log_stress_eval_real_time(client):
+def log_stress_eval_real_time(client, stress_val):
     """
     Attach a Stress-Threshold evaluation to the latest agent step.
     Skips gracefully when no span or stress value is present yet.
     """
+    # Only log a stress measurement from this run, never a leftover file.
+    if stress_val is None:
+        return
     # 1️⃣ fetch the most-recent ReActAgent step
     df_span = (
         client.query_spans(
@@ -139,18 +142,13 @@ def log_stress_eval_real_time(client):
     latest_span_id = df_span.index[0]
 
     # 2️⃣ deterministic stress check
-    stress_val = parse_stress_mpa()
-    if stress_val is None:       # file not created yet
-        label, score = "not", 0.0
-        explanation = "Stress value not available for this step."
-    else:
-        exceeds = stress_val > stress_threshold
-        label, score = ("exceeded", 1.0) if exceeds else ("not", 0.0)
-        explanation = (
-            f"Stress = {stress_val:.1f} MPa exceeds threshold {stress_threshold:.1f} MPa"
-            if exceeds
-            else f"Stress = {stress_val:.1f} MPa is below threshold {stress_threshold:.1f} MPa"
-        )
+    exceeds = stress_val > stress_threshold
+    label, score = ("exceeded", 1.0) if exceeds else ("not", 0.0)
+    explanation = (
+        f"Stress = {stress_val:.1f} MPa exceeds threshold {stress_threshold:.1f} MPa"
+        if exceeds
+        else f"Stress = {stress_val:.1f} MPa is below threshold {stress_threshold:.1f} MPa"
+    )
 
     graded = pd.DataFrame(
         {"label": [label], "score": [score], "explanation": [explanation]},

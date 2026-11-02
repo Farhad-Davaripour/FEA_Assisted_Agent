@@ -1,4 +1,4 @@
-import os, json, re, asyncio, streamlit as st
+import os, json, re, asyncio, uuid, streamlit as st
 from dotenv import load_dotenv
 
 from phoenix.otel import register
@@ -13,7 +13,8 @@ from llama_index.core.tools import FunctionTool
 from llama_index.core.agent import ReActAgent
 from llama_index.core.agent.workflow.workflow_events import ToolCall, ToolCallResult
 
-from src.tools import run_abaqus, extract_von_mises_stress_from_ODB, extract_action
+from src.tools import extract_action
+from src.workflow_tools import AnalysisToolContext, EXISTING, DEMO
 from src.prompt_temp import (
     react_system_prompt as RA_SYSTEM_PROMPT,
     TOOL_CALLING_PROMPT_TEMPLATE,
@@ -22,12 +23,14 @@ from src.prompt_temp import (
 )
 import pandas as pd
 
-from src.eval_utils import run_eval, log_stress_eval_real_time
+from src.eval_utils import run_eval, parse_stress_mpa
 
 load_dotenv(override=True)
 stress_threshold = float(os.getenv("STRESS_THRESHOLD", 360.0))
 abaqus_files_dir = "src/abaqus_files"
 os.makedirs(abaqus_files_dir, exist_ok=True)
+if "fea_session_id" not in st.session_state:
+    st.session_state.fea_session_id = uuid.uuid4().hex
 
 # ---------- observability (run once) ---------- #
 @st.cache_resource(show_spinner=False)
@@ -52,33 +55,23 @@ llm_type_eval_high = st.sidebar.selectbox(
 )
 
 # ---------- tools ---------- #
-abaqus_job_execution_tool = FunctionTool.from_defaults(
-    fn=run_abaqus,
-    name="Abaqus_job_executor",
-    description="Runs an Abaqus job using a user-provided `.inp` file stored in `src/abaqus_files`. Preferred argument: `inp_file_name` (e.g. `beam_case.inp`).",
-)
-
-von_mises_stress_extraction_tool = FunctionTool.from_defaults(
-    fn=extract_von_mises_stress_from_ODB,
-    name="Von_Mises_stress_extractor",
-    description="Extracts max Von-Mises stress from an Abaqus ODB (returns MPa). Optional argument: `job_name` (without extension). If omitted, uses the latest run.",
-)
-
-tools = [
-    abaqus_job_execution_tool,
-    von_mises_stress_extraction_tool,
-]
-
-# ---------- init agent (once) ---------- #
-if "agent" not in st.session_state:
+def _build_agent(context):
+    tools = [
+        FunctionTool.from_defaults(
+            fn=context.generate, name="Abaqus_input_file_generator",
+            description="Generate the built-in steel cantilever example with displacement in metres."),
+        FunctionTool.from_defaults(
+            fn=context.run, name="Abaqus_job_executor",
+            description="Run the selected input file, or a generated cantilever input. Pass inp_file_name."),
+        FunctionTool.from_defaults(
+            fn=context.extract, name="Von_Mises_stress_extractor",
+            description="Extract the current successful run's maximum stress in MPa."),
+    ]
     llm = llma_OpenAI(model=llm_type)
-    st.session_state.agent = ReActAgent(
-        tools=tools, llm=llm, verbose=True, streaming=False
-    )
+    agent = ReActAgent(tools=tools, llm=llm, verbose=True, streaming=False)
     with suppress_tracing():
-        st.session_state.agent.update_prompts({"react_header": RA_SYSTEM_PROMPT()})
-
-agent = st.session_state.agent
+        agent.update_prompts({"react_header": RA_SYSTEM_PROMPT()})
+    return agent, tools
 
 
 def _run_async(coro):
@@ -105,6 +98,7 @@ async def _run_agent_with_progress(agent_obj, user_query):
         early_stopping_method="generate",
     )
     progress_entries = []
+    latest_stress = None
 
     async for ev in handler.stream_events():
         if isinstance(ev, ToolCall):
@@ -113,12 +107,14 @@ async def _run_agent_with_progress(agent_obj, user_query):
         elif isinstance(ev, ToolCallResult):
             output_text = ev.tool_output.content or str(ev.tool_output.raw_output)
             progress_entries.append(f"**Observation** {output_text}")
+            if ev.tool_name == "Von_Mises_stress_extractor":
+                latest_stress = parse_stress_mpa(output_text)
 
     result = await handler
     reasoning_steps = await handler.ctx.store.get(
         getattr(agent_obj, "reasoning_key", "current_reasoning"), default=[]
     )
-    return result, progress_entries, reasoning_steps
+    return result, progress_entries, reasoning_steps, latest_stress
 
 # ================== UI ================== #
 st.title("Finite Element Analysis Assistant")
@@ -128,16 +124,40 @@ st.markdown("""
             1. **Input Selection:** Upload or select an existing Abaqus `.inp` file from `src/abaqus_files`.
             2. **Job Execution:** The `Abaqus_job_executor` tool runs Abaqus using the selected `.inp` file.
             3. **Stress Extraction:** The `Von_Mises_stress_extractor` tool reads the generated ODB and reports maximum Von-Mises stress in MPa.
-            4. **Evaluation Logging:** The app logs threshold-based evaluation results using `STRESS_THRESHOLD`.
+            4. **Threshold comparison:** Compare the returned stress with `STRESS_THRESHOLD` in MPa.
             """)
 
-uploaded_inp = st.file_uploader("Upload Abaqus .inp file", type=["inp"])
+input_mode = st.radio(
+    "Input", ["Use an existing input file", "Generate the built-in cantilever example"],
+    key="input_mode",
+)
+if input_mode == "Use an existing input file":
+    st.selectbox(
+        "Stress unit used by this Abaqus model",
+        options=["Pa", "MPa"],
+        index=None,
+        placeholder="Select the model's stress unit",
+        key="existing_model_unit",
+        help="Abaqus uses the consistent units of the model. Select the unit used for its stress values.",
+    )
+else:
+    st.info("The built-in cantilever uses Pa for stress; results are converted to MPa.")
+uploaded_inp = st.file_uploader("Upload Abaqus .inp file", type=["inp"]) if input_mode == "Use an existing input file" else None
+upload_conflict = False
 if uploaded_inp is not None:
     uploaded_name = os.path.basename(uploaded_inp.name)
     uploaded_path = os.path.join(abaqus_files_dir, uploaded_name)
-    with open(uploaded_path, "wb") as f:
-        f.write(uploaded_inp.getbuffer())
-    st.success(f"Uploaded `{uploaded_name}` to `{abaqus_files_dir}`")
+    uploaded_bytes = uploaded_inp.getvalue()
+    if os.path.exists(uploaded_path):
+        with open(uploaded_path, "rb") as f:
+            upload_conflict = f.read() != uploaded_bytes
+    else:
+        with open(uploaded_path, "xb") as f:
+            f.write(uploaded_bytes)
+    if upload_conflict:
+        st.error("A different file with this name already exists. Rename your input file before uploading.")
+    else:
+        st.success(f"Uploaded `{uploaded_name}` to `{abaqus_files_dir}`")
 
 available_inp_files = sorted(
     file_name
@@ -147,9 +167,14 @@ available_inp_files = sorted(
 selected_inp_file = st.selectbox(
     "Select Abaqus input file",
     options=available_inp_files if available_inp_files else ["<none>"],
+    key="selected_input_file",
 )
-if not available_inp_files:
+if not available_inp_files and input_mode == "Use an existing input file":
     st.warning("No `.inp` files found. Upload one to continue.")
+displacement = None
+if input_mode == "Generate the built-in cantilever example":
+    st.info("The built-in generator creates the fixed steel cantilever example; it is not a general input-file editor.")
+    displacement = st.number_input("Downward displacement (m)", min_value=0.0, max_value=0.2, value=0.02, step=0.01)
 
 logo_file_path = "artifacts/cantilever_beam_schematic.png"
 if os.path.exists(logo_file_path):
@@ -167,17 +192,34 @@ default_query = (
 query = st.text_area("Enter your query:", default_query)
 
 if st.button("Submit"):
-    if not available_inp_files:
+    if upload_conflict:
+        st.error("Resolve the input filename conflict before running.")
+        st.stop()
+    if input_mode == "Use an existing input file" and not st.session_state.get("existing_model_unit"):
+        st.error("Select the stress unit used by the Abaqus model before running.")
+        st.stop()
+    if input_mode == "Use an existing input file" and not available_inp_files:
         st.error("Please upload at least one `.inp` file before running the agent.")
         st.stop()
 
-    query_with_inp_context = (
-        f"Use the input file `{selected_inp_file}` from `src/abaqus_files` for this run.\n"
-        f"{query}"
-    )
+    if input_mode == "Use an existing input file":
+        input_context = f"Use the input file `{selected_inp_file}` from `src/abaqus_files` for this run."
+    else:
+        input_context = (
+            f"Generate the built-in cantilever input with applied_displacement={displacement} metres; "
+            "use the generated input filename for the subsequent Abaqus job."
+        )
+    query_with_inp_context = f"{input_context}\n{query}"
     with st.spinner("Processing..."):
         try:
-            result, progress_entries, reasoning_steps = _run_async(
+            context = AnalysisToolContext(
+                mode=input_mode, selected_input=selected_inp_file,
+                unit=st.session_state.get("existing_model_unit"),
+                session_id=st.session_state.fea_session_id,
+            )
+            agent, tools = _build_agent(context)
+            st.session_state.current_tools = tools
+            result, progress_entries, reasoning_steps, latest_stress = _run_async(
                 _run_agent_with_progress(agent, query_with_inp_context)
             )
         except Exception as exc:
@@ -190,11 +232,18 @@ if st.button("Submit"):
                     st.markdown(entry)
             else:
                 st.info("No intermediate tool events captured for this run.")
-            log_stress_eval_real_time(px.Client())
 
+        if not context.current_run:
+            st.error("No verified Abaqus run completed. The assistant's answer cannot be presented as a simulation result.")
+            st.stop()
+        if latest_stress is None:
+            st.warning("The Abaqus run completed, but no verified stress was extracted. No stress result is available.")
+            st.stop()
         final_answer = result.response.content or ""
 
-        st.subheader("Final Answer:")
+        st.metric("Extracted maximum von Mises stress", f"{latest_stress:g} MPa")
+        st.subheader("Assistant's explanation:")
+        st.caption("Check the explanation against the extracted value and the model assumptions.")
         st.markdown(final_answer)
 
         st.subheader("Intermediate Reasoning and Acting Steps:")
@@ -237,7 +286,7 @@ def tool_utilization_eval():
                     )(*extract_action(r.output_messages)),
                     axis=1,
                 ),
-                "tool_definitions": [tools] * len(df),
+                "tool_definitions": [st.session_state.get("current_tools", [])] * len(df),
             },
             index=df.index,
         ),
@@ -251,7 +300,7 @@ def unit_eval():
         (getattr(t.metadata, "name", None) if hasattr(t, "metadata") else getattr(t, "name", None)): (
             t.metadata.description if hasattr(t, "metadata") else ""
         )
-        for t in tools
+        for t in st.session_state.get("current_tools", [])
     }
     return run_eval(
         span_kind="TOOL",
@@ -294,24 +343,7 @@ def hallucination_eval():
         retries=2,
     )
 
-# -------------- Streamlit buttons -------------- #
+# Phoenix spans are shared across sessions; avoid attributing another user's
+# trace to this run until observability has explicit per-session trace IDs.
 st.subheader("Offline Evaluation")
-if st.button("Planning Correctness: Hallucination Eval"):
-    graded = hallucination_eval()
-    if graded.empty:
-        st.info("No agent spans found in the latest trace.")
-    else:
-        st.success("✅ Final answer marked correct" if graded["score"].iloc[0] == 0 else "❌ Final answer marked incorrect")
-if st.button("Tool Utilization: Tool Mapping"):
-    graded = tool_utilization_eval()
-    if graded.empty:
-        st.info("No tool‑calling LLM spans found in the latest trace.")
-    else:
-        st.success(f"✅ {int(graded['score'].sum())}/{len(graded)} calls marked correct")
-
-if st.button("Tool Utilization: Unit Correctness"):
-    graded = unit_eval()
-    if graded.empty:
-        st.info("No TOOL spans found in the latest trace.")
-    else:
-        st.success(f"✅ {int(graded['score'].sum())}/{len(graded)} tool calls have correct units")
+st.info("Offline evaluations are temporarily unavailable until traces can be scoped to this session.")

@@ -1,4 +1,4 @@
-# -*- coding: mbcs -*-
+# -*- coding: utf-8 -*-
 # Do not delete the following import lines
 from abaqus import *
 from abaqusConstants import *

@@ -7,3 +7,6 @@ __pycache__/
 
 # Virtual environment
 .venv/
+
+# User input files and Abaqus output
+src/abaqus_files/

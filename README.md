@@ -1,63 +1,48 @@
-# Finite Element Analysis (FEA) Assisted Agent
+# FEA Assisted Agent
 
-## Overview
-The **FEA Assisted Agent** automates Abaqus finite element simulations. It uses OpenAI models through **LlamaIndex** and provides a Streamlit UI to execute jobs, extract stresses, and run parametric studies. Phoenix is used for tracing and evaluation.
+This experimental assistant uses Abaqus to run finite element analyses, extract maximum von Mises stress, and explain the results. A Streamlit interface accepts a question; a LlamaIndex agent selects the tools; Phoenix provides tracing. Abaqus performs the simulation. An AI-generated explanation is not a substitute for engineering review.
 
-## Features
-1. **User-Provided Input Files**: Upload/select your own Abaqus `.inp` files in the app.
-2. **Abaqus Job Executor**: Runs the simulation from the selected `.inp` and gathers outputs.
-3. **Von-Mises Stress Extractor**: Parses ODB output and stores peak stress in `max_vm_stress.txt`.
-4. **Repeatable Runs**: Reuse different `.inp` files without changing code.
-5. **Real-Time Stress Evaluation**: Logs whether stress exceeds `STRESS_THRESHOLD`.
+Offline AI evaluations and threshold-trace logging are temporarily disabled: the previous implementation could select traces belonging to a different session and is incompatible with the pinned Phoenix client. The app displays the extracted stress, and its default request asks the assistant to compare it with the configured threshold.
 
-## Environment Variables (`.env`)
-This project loads environment variables from a local `.env` file using `python-dotenv`.
+You can supply your own Abaqus `.inp` file. The original cantilever-pipe input generator remains available as a demonstration: it varies the applied displacement of a fixed example model, rather than parameterizing arbitrary input files.
 
-Create it from the template:
+## Requirements
+
+- Python 3.12 and the versions in `requirements.txt`.
+- A working Abaqus installation and license, with the `abaqus` command available on the path used to launch the app.
+- An OpenAI API key for the assistant and evaluation features. API usage can incur charges.
+- A self-contained UTF-8 Abaqus `.inp` file, or the built-in cantilever example. Files using `*INCLUDE` are currently rejected because their referenced files are not yet supported.
+
+Abaqus has no built-in system of units. Select the stress unit used by your model explicitly; the app converts supported units to MPa for display and threshold comparisons. Check that your model, its inputs, and the unit selection are consistent before interpreting results.
+
+## Setup
+
+Create a virtual environment, install the dependencies, and create a local `.env` file from the template. On Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+On macOS or Linux, use `python3.12 -m venv .venv`, activate with `source .venv/bin/activate`, and copy the template with `cp .env.example .env`. Edit `.env` locally and set `OPENAI_API_KEY`. Never commit the file. `STRESS_THRESHOLD` is optional and expressed in MPa; its default is 360. `OTEL_EXPORTER_OTLP_ENDPOINT` is optional.
+
+Start the app from the repository root:
 
 ```bash
-cp .env.example .env
+streamlit run app.py
 ```
 
-Then set values:
+Select or upload an input file, choose its stress unit, and submit a request. Inputs and generated artifacts live under `src/abaqus_files/`, which is ignored by Git. Each solver run has its own output directory. Stress extraction only uses the session's latest verified successful run; a new attempt clears the previous selection. Input files are shared between sessions, so this is not a fully isolated multi-user service. Do not delete results you wish to preserve.
 
-- `OPENAI_API_KEY` (required): API key used by the agent and eval judges.
-- `STRESS_THRESHOLD` (optional, default `360.0`): Stress target in MPa.
-- `OTEL_EXPORTER_OTLP_ENDPOINT` (optional): Phoenix/OTel collector endpoint (for example `localhost:4317`).
+The completion check requires a successful Abaqus `.sta` status file, an ODB, and no active lock file. Other solver status formats are reported as unverified. On Windows, the `.bat` launcher requires paths and arguments without shell metacharacters; spaces are supported. If the app process crashes during an operation, its session lock may need manual cleanup after confirming the Abaqus process is no longer running.
 
-Example:
+## Local checks
 
-```env
-OPENAI_API_KEY=sk-...
-STRESS_THRESHOLD=360.0
-OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
+```bash
+python -m unittest discover -s tests -v
+python -m pip check
 ```
 
-## Setup and Run
-1. Create a virtual environment:
-   ```bash
-   python3 -m venv .venv
-   ```
-2. Activate it:
-   ```bash
-   source .venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Configure `.env` as described above.
-5. Start the app:
-   ```bash
-   streamlit run app.py
-   ```
-6. In the UI, upload/select an `.inp` file, then submit your query.
-
-## Notes
-- Streamlit may print telemetry information on startup. To disable usage stats:
-  - Add this to `~/.streamlit/config.toml`:
-    ```toml
-    [browser]
-    gatherUsageStats = false
-    ```
-- Phoenix may log optional warnings (for example Bedrock support). Those do not block normal OpenAI-based runs.
+The automated tests use simulated Abaqus responses and do not validate a real solver, license, model, or physical result. A real Abaqus smoke test is still required on a licensed machine for the intended input files and operating system.
