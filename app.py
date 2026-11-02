@@ -281,6 +281,14 @@ if st.button("Submit"):
                 )
                 root_span.set_attribute("input.value", json.dumps({
                     "query": query_with_inp_context,
+                    # Preserve the actual tool contracts alongside observations
+                    # so the evaluator can interpret, for example, that the
+                    # stress extractor reports the maximum rather than an
+                    # arbitrary value from the analysis.
+                    "tool_definitions": [
+                        {"name": tool.metadata.name, "description": tool.metadata.description}
+                        for tool in tools
+                    ],
                     "tool_events": progress_entries,
                     "reasoning_steps": reasoning_steps,
                 }, default=str))
