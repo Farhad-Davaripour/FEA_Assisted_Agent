@@ -7,6 +7,25 @@ EXISTING = "Use an existing input file"
 DEMO = "Generate the built-in cantilever example"
 
 
+def _input_name(requested):
+    """Accept a bare name or its exact, relative input-directory equivalent."""
+    if not isinstance(requested, str) or not requested:
+        return None
+    # LLMs may include the input directory using either platform's separator.
+    # Never resolve arbitrary paths: require the literal relative prefix and a
+    # single remaining filename, with no traversal, absolute, or nested path.
+    path = requested.replace("\\", "/")
+    if "/" not in path:
+        return path if path not in (".", "..") else None
+    prefix = "src/abaqus_files/"
+    if not path.startswith(prefix):
+        return None
+    name = path[len(prefix):]
+    if not name or "/" in name or name in (".", ".."):
+        return None
+    return name
+
+
 class AnalysisToolContext:
     def __init__(self, mode, selected_input, unit, session_id):
         self.mode = mode
@@ -30,12 +49,14 @@ class AnalysisToolContext:
         """Run the selected input, or an input generated in this turn."""
         self.current_run = None
         if self.mode == EXISTING:
-            if inp_file_name and inp_file_name != self.selected_input:
+            if inp_file_name and _input_name(inp_file_name) != self.selected_input:
                 return "The requested input does not match the selected input file."
             inp_file_name = self.selected_input
         else:
             if not inp_file_name and len(self.generated_inputs) == 1:
                 inp_file_name = self.generated_inputs[0]
+            else:
+                inp_file_name = _input_name(inp_file_name)
             if inp_file_name not in self.generated_inputs:
                 return "In cantilever mode, run an input generated in this session."
         result = run_abaqus(

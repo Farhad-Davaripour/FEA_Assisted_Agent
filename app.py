@@ -9,11 +9,13 @@ import phoenix as px
 from phoenix.evals import LLM
 
 from llama_index.llms.openai import OpenAI as llma_OpenAI
+from llama_index.llms.openai import OpenAIResponses as llma_OpenAIResponses
 from llama_index.core.tools import FunctionTool
 from llama_index.core.agent import ReActAgent
 from llama_index.core.agent.workflow.workflow_events import ToolCall, ToolCallResult
 
 from src.trace_actions import extract_traced_action
+from src.terra_judge import TerraResponsesJudge
 from src.workflow_tools import AnalysisToolContext, EXISTING, DEMO
 from src.prompt_temp import (
     react_system_prompt as RA_SYSTEM_PROMPT,
@@ -26,7 +28,7 @@ from opentelemetry.context import Context
 
 from src.eval_utils import run_eval, parse_stress_mpa, log_stress_eval_real_time
 
-load_dotenv(override=True)
+load_dotenv(override=False)
 stress_threshold = float(os.getenv("STRESS_THRESHOLD", 360.0))
 abaqus_files_dir = "src/abaqus_files"
 os.makedirs(abaqus_files_dir, exist_ok=True)
@@ -75,12 +77,12 @@ def init_observability():
 session, tracer_provider = init_observability()
 
 # ---------- LLM picker ---------- #
-llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4.1"])
+llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4.1", "gpt-6.1-terra"])
 llm_type_eval = st.sidebar.selectbox(
-    "Select LLM type (judge)", ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"]
+    "Select LLM type (judge)", ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4o", "gpt-4.1", "gpt-6.1-terra"]
 )
 llm_type_eval_high = st.sidebar.selectbox(
-    "Select LLM type (judge high reasoning)", ["gpt-4.1"]
+    "Select LLM type (judge high reasoning)", ["gpt-4.1", "gpt-6.1-terra"]
 )
 
 # ---------- tools ---------- #
@@ -96,7 +98,19 @@ def _build_agent(context):
             fn=context.extract, name="Von_Mises_stress_extractor",
             description="Extract the current successful run's maximum stress in MPa."),
     ]
-    llm = llma_OpenAI(model=llm_type)
+    if llm_type == "gpt-6.1-terra":
+        # This pinned LlamaIndex version predates Terra's model metadata.
+        # Use Responses and supply the published context size explicitly.
+        # An empty reasoning_options removes unsupported sampling parameters;
+        # the reasoning setting is passed through additional_kwargs.
+        llm = llma_OpenAIResponses(
+            model=llm_type,
+            context_window=1_050_000,
+            reasoning_options={},
+            additional_kwargs={"reasoning": {"effort": "medium"}},
+        )
+    else:
+        llm = llma_OpenAI(model=llm_type)
     agent = ReActAgent(tools=tools, llm=llm, verbose=True, streaming=False)
     with suppress_tracing():
         agent.update_prompts({"react_header": RA_SYSTEM_PROMPT()})
@@ -323,6 +337,12 @@ if st.button("Submit"):
                 st.markdown("----")
 # -------------- evaluation helpers -------------- #
 
+def _build_judge(model):
+    if model == "gpt-6.1-terra":
+        return TerraResponsesJudge()
+    return LLM(provider="openai", model=model)
+
+
 def _tool_call_rows(df):
     rows = []
     for span_id, row in df.iterrows():
@@ -338,7 +358,7 @@ def _tool_call_rows(df):
 
 
 def tool_utilization_eval():
-    judge = LLM(provider="openai", model=llm_type_eval_high)
+    judge = _build_judge(llm_type_eval_high)
     rails = ["correct", "incorrect"]
     return run_eval(
         trace_id=st.session_state.get("fea_trace_id"),
@@ -358,7 +378,7 @@ def tool_utilization_eval():
     )
 
 def unit_eval():
-    judge = LLM(provider="openai", model=llm_type_eval)
+    judge = _build_judge(llm_type_eval)
     rails = ["correct", "incorrect"]
     tool_lookup = {
         (getattr(t.metadata, "name", None) if hasattr(t, "metadata") else getattr(t, "name", None)): (
@@ -391,7 +411,7 @@ def unit_eval():
     )
 
 def hallucination_eval():
-    judge = LLM(provider="openai", model=llm_type_eval)
+    judge = _build_judge(llm_type_eval)
     return run_eval(
         trace_id=st.session_state.get("fea_trace_id"),
         span_kind="AGENT",

@@ -11,7 +11,7 @@ from phoenix.client import Client
 from phoenix.client.types.spans import SpanQuery
 from phoenix.evals import create_classifier, evaluate_dataframe
 
-load_dotenv(override=True)
+load_dotenv(override=False)
 stress_threshold = float(os.getenv("STRESS_THRESHOLD", 360.0))
 PHOENIX_PROJECT_NAME = "fea-assisted-agent"
 
