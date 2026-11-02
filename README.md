@@ -7,7 +7,7 @@ The built-in demonstration varies the end displacement of a fixed steel cantilev
 ## Requirements
 
 - Python 3.12, with the pinned dependencies in `requirements.txt`.
-- An installed Abaqus solver and CAE, licensed for your intended use. The `abaqus` command must be on the **PATH of the terminal that starts the app**.
+- An Abaqus installation licensed for your intended use, with a solver and Abaqus Python for running inputs and reading results. The built-in input generator also needs Abaqus/CAE. The `abaqus` command must be on the **PATH of the terminal that starts the app**.
 - An OpenAI API key with access to the selected models. Agent runs and AI evaluations make API calls that may incur charges.
 - A self-contained UTF-8 Abaqus `.inp` file, or the built-in example. The app currently rejects `*INCLUDE`; it does not collect external input files referenced by a model.
 
