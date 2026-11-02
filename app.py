@@ -13,7 +13,7 @@ from llama_index.core.tools import FunctionTool
 from llama_index.core.agent import ReActAgent
 from llama_index.core.agent.workflow.workflow_events import ToolCall, ToolCallResult
 
-from src.tools import extract_action
+from src.trace_actions import extract_traced_action
 from src.workflow_tools import AnalysisToolContext, EXISTING, DEMO
 from src.prompt_temp import (
     react_system_prompt as RA_SYSTEM_PROMPT,
@@ -326,19 +326,9 @@ if st.button("Submit"):
 def _tool_call_rows(df):
     rows = []
     for span_id, row in df.iterrows():
-        messages = row.get("output_messages")
-        if isinstance(messages, str):
-            try:
-                messages = json.loads(messages)
-            except (TypeError, ValueError):
-                continue
-        if not isinstance(messages, list):
-            continue
-        try:
-            name, args = extract_action(messages)
-        except (AttributeError, TypeError):
-            continue
-        if name:
+        action = extract_traced_action(row.get("output_messages"), row.get("output_value"))
+        if action:
+            name, args = action
             rows.append({"span_id": span_id, "question": row.get("question"),
                          "tool_call": f"{name}({args})",
                          "tool_definitions": str(st.session_state.get("current_tools", []))})
@@ -357,6 +347,7 @@ def tool_utilization_eval():
             start_time="start_time",
             question="input.value",
             output_messages="llm.output_messages",
+            output_value="output.value",
         ),
         template=TOOL_CALLING_PROMPT_TEMPLATE,
         rails=rails,
