@@ -1,162 +1,131 @@
-import os, json, re
-from dotenv import load_dotenv
-from typing import Callable, Dict, List
+"""Session-scoped Phoenix evaluations for the current submitted analysis."""
+import math
+import os
+import re
+import time
+from typing import Callable, Dict, List, Optional
+
 import pandas as pd
-import phoenix as px
+from dotenv import load_dotenv
+from phoenix.client import Client
+from phoenix.client.types.spans import SpanQuery
 from phoenix.evals import create_classifier, evaluate_dataframe
-try:
-    from phoenix.evals import llm_classify  # Older Phoenix API
-except ImportError:
-    llm_classify = None
-from phoenix.trace import SpanEvaluations
-from phoenix.trace.dsl import SpanQuery
+
 load_dotenv(override=True)
 stress_threshold = float(os.getenv("STRESS_THRESHOLD", 360.0))
+PHOENIX_PROJECT_NAME = "fea-assisted-agent"
 
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    message="Series.__getitem__ treating keys as positions is deprecated",
-    category=FutureWarning,
-    module="phoenix.trace.dsl.query",
-)
 
-def run_eval(
-    *,
-    span_kind: str,
-    select: Dict[str, str],
-    post_process: Callable[[pd.DataFrame], pd.DataFrame],
-    template: str,
-    rails: List[str],
-    judge,
-    eval_name: str,
-    num_steps: int = 3,
-    retries: int = 0,                 # 👈 NEW
-) -> pd.DataFrame:
-    """Grade spans with an LLM, retrying up to `retries` extra times if not all pass."""
-    client = px.Client()
-    df = (
-        client.query_spans(
-            SpanQuery().where(f"span_kind == '{span_kind}'").select(**select)
-        )
-        .sort_values("start_time")
-        .tail(num_steps)
-    )
+def _new_client():
+    return Client(base_url=os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://127.0.0.1:6006").rstrip("/"))
 
+
+def _scoped_spans(client, trace_id: str, span_kind: str, select: Dict[str, str]) -> pd.DataFrame:
+    """Query exactly one trace and verify returned trace IDs again client-side."""
+    if not isinstance(trace_id, str) or not re.fullmatch(r"[0-9a-f]{32}", trace_id) or int(trace_id, 16) == 0:
+        raise ValueError("A valid trace ID for the current submission is required.")
+    if span_kind not in ("AGENT", "LLM", "TOOL"):
+        raise ValueError("Unsupported span kind.")
+    fields = dict(select)
+    fields["_fea_trace_id"] = "context.trace_id"
+    query = SpanQuery().where(
+        f"trace_id == '{trace_id}' and span_kind == '{span_kind}'"
+    ).select(*fields.values())
+    # Export completion does not guarantee the Phoenix server has indexed the
+    # span yet. Briefly retry an empty result, never broadening the trace scope.
+    for attempt in range(5):
+        df = client.spans.get_spans_dataframe(query=query, project_identifier=PHOENIX_PROJECT_NAME)
+        if not df.empty or attempt == 4:
+            break
+        time.sleep(0.25)
     if df.empty:
         return pd.DataFrame()
+    # The current client normalizes context.trace_id but the server returns the
+    # qualified column name; normalize aliases after retrieval.
+    aliases = {}
+    for name, field in fields.items():
+        for candidate in (field, f"attributes.{field}", name):
+            if candidate in df.columns:
+                aliases[candidate] = name
+                break
+    df = df.rename(columns=aliases)
+    if "_fea_trace_id" not in df.columns:
+        raise ValueError("Phoenix did not return trace identifiers; evaluation was skipped.")
+    df = df[df["_fea_trace_id"] == trace_id].drop(columns=["_fea_trace_id"])
+    if df.empty:
+        return pd.DataFrame()
+    if "start_time" not in df.columns:
+        raise ValueError("Phoenix did not return span timestamps; evaluation was skipped.")
+    return df.sort_values("start_time")
 
+
+def run_eval(*, trace_id: str, span_kind: str, select: Dict[str, str],
+             post_process: Callable[[pd.DataFrame], pd.DataFrame], template: str,
+             rails: List[str], judge, eval_name: str, num_steps: int = 3,
+             retries: int = 0, client: Optional[Client] = None) -> pd.DataFrame:
+    """Evaluate this submission's spans; retry only invalid/empty classifications."""
+    client = client or _new_client()
+    df = _scoped_spans(client, trace_id, span_kind, select).tail(num_steps)
+    if df.empty:
+        return pd.DataFrame()
     eval_col_name = re.sub(r"[^a-zA-Z0-9_]+", "_", eval_name).strip("_").lower() or "eval"
-
-    def _classify_with_current_api(processed: pd.DataFrame) -> pd.DataFrame:
-        evaluator = create_classifier(
-            name=eval_col_name,
-            prompt_template=template,
-            llm=judge,
-            choices=rails,
-        )
-        evaluated = evaluate_dataframe(
-            dataframe=processed,
-            evaluators=[evaluator],
-            hide_tqdm_bar=True,
-        )
+    processed = post_process(df)
+    if processed.empty:
+        return pd.DataFrame()
+    # Postprocessing must preserve the scoped span indices before they are annotated.
+    if not processed.index.isin(df.index).all():
+        raise ValueError("Evaluation included spans outside the current trace.")
+    evaluator = create_classifier(name=eval_col_name, prompt_template=template, llm=judge, choices=rails)
+    graded = pd.DataFrame()
+    for _ in range(retries + 1):
+        evaluated = evaluate_dataframe(dataframe=processed, evaluators=[evaluator], hide_tqdm_bar=True)
         score_col = f"{eval_col_name}_score"
         if score_col not in evaluated.columns:
-            return pd.DataFrame()
-        raw = evaluated[score_col].apply(lambda x: x if isinstance(x, dict) else {})
-        return pd.DataFrame(
-            {
-                "label": raw.apply(lambda d: d.get("label")),
-                "score": raw.apply(lambda d: d.get("score")),
-                "explanation": raw.apply(lambda d: d.get("explanation")),
-            },
-            index=processed.index,
-        )
-
-    # ------- retry loop ---------------------------------------------------
-    graded = None
-    for _ in range(retries + 1):                      # first try + N retries
-        processed = post_process(df)
-        if llm_classify is not None:
-            graded = llm_classify(
-                data=processed,
-                template=template,
-                rails=rails,
-                model=judge,
-                provide_explanation=True,
-                run_sync=True,
-            )
-        else:
-            graded = _classify_with_current_api(processed)
-
-        # Phoenix v3 classifier may not return numeric score by default.
-        if graded.empty or "label" not in graded.columns:
             continue
+        raw = evaluated[score_col].apply(lambda x: x if isinstance(x, dict) else {})
+        graded = pd.DataFrame({
+            "label": raw.apply(lambda d: d.get("label")),
+            "explanation": raw.apply(lambda d: d.get("explanation")),
+        }, index=processed.index)
         graded = graded[graded["label"].isin(rails)].copy()
         if graded.empty:
             continue
         graded["score"] = (graded["label"] == rails[0]).astype(float)
-        break  # Never retry a valid result in search of a preferred answer.
-    # ---------------------------------------------------------------------
-
-    if graded is None or graded.empty:
+        break  # Never retry a valid label in pursuit of a preferred answer.
+    if graded.empty:
         return pd.DataFrame()
     graded.index.name = "span_id"
-    client.log_evaluations(
-        SpanEvaluations(eval_name=eval_name, dataframe=graded)
-    )
+    client.spans.log_span_annotations_dataframe(dataframe=graded, annotation_name=eval_name,
+                                                annotator_kind="LLM", sync=True)
     return graded
+
 
 def parse_stress_mpa(output):
     """Parse only a tool result explicitly reported in MPa."""
     match = re.fullmatch(
         r"von_mises stress is\s+([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\s+MPa",
-        output.strip(),
-        flags=re.IGNORECASE,
+        output.strip(), flags=re.IGNORECASE,
     )
     return float(match.group(1)) if match else None
-    
-# --- revised helper (same signature, no .order_by/.limit) -------------
-def log_stress_eval_real_time(client, stress_val):
-    """
-    Attach a Stress-Threshold evaluation to the latest agent step.
-    Skips gracefully when no span or stress value is present yet.
-    """
-    # Only log a stress measurement from this run, never a leftover file.
-    if stress_val is None:
-        return
-    # 1️⃣ fetch the most-recent ReActAgent step
-    df_span = (
-        client.query_spans(
-            SpanQuery()
-            .where("span_kind == 'AGENT'")
-            .select()
-        )
-        .sort_values("start_time")
-        .tail(1)                 # equivalent to order_by + limit
-    )
 
-    if df_span.empty:            # nothing to tag yet
-        return
 
-    latest_span_id = df_span.index[0]
-
-    # 2️⃣ deterministic stress check
+def log_stress_eval_real_time(*, trace_id: str, stress_val: float,
+                              client: Optional[Client] = None) -> bool:
+    """Record threshold comparison only on this submission's latest agent span."""
+    if stress_val is None or not math.isfinite(stress_val) or stress_val < 0:
+        return False
+    client = client or _new_client()
+    df_span = _scoped_spans(client, trace_id, "AGENT", {"start_time": "start_time"}).tail(1)
+    if df_span.empty:
+        return False
     exceeds = stress_val > stress_threshold
     label, score = ("exceeded", 1.0) if exceeds else ("not", 0.0)
-    explanation = (
-        f"Stress = {stress_val:.1f} MPa exceeds threshold {stress_threshold:.1f} MPa"
-        if exceeds
-        else f"Stress = {stress_val:.1f} MPa is below threshold {stress_threshold:.1f} MPa"
-    )
-
-    graded = pd.DataFrame(
-        {"label": [label], "score": [score], "explanation": [explanation]},
-        index=[latest_span_id],
-    )
+    relation = "exceeds" if exceeds else "does not exceed"
+    graded = pd.DataFrame({
+        "label": [label], "score": [score],
+        "explanation": [f"Stress = {stress_val:g} MPa {relation} threshold {stress_threshold:g} MPa"],
+    }, index=df_span.index)
     graded.index.name = "span_id"
-
-    # 3️⃣ write to Phoenix
-    client.log_evaluations(
-        SpanEvaluations(eval_name="Stress Thresh", dataframe=graded)
-    )
+    client.spans.log_span_annotations_dataframe(dataframe=graded, annotation_name="Stress Thresh",
+                                                annotator_kind="CODE", sync=True)
+    return True

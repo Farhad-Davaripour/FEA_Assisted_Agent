@@ -2,7 +2,7 @@
 
 This experimental assistant uses Abaqus to run finite element analyses, extract maximum von Mises stress, and explain the results. A Streamlit interface accepts a question; a LlamaIndex agent selects the tools; Phoenix provides tracing. Abaqus performs the simulation. An AI-generated explanation is not a substitute for engineering review.
 
-Offline AI evaluations and threshold-trace logging are temporarily disabled: the previous implementation could select traces belonging to a different session and is incompatible with the pinned Phoenix client. The app displays the extracted stress, and its default request asks the assistant to compare it with the configured threshold.
+Phoenix traces and evaluations are scoped to the current analysis. The app displays the extracted stress, and its default request asks the assistant to compare it with the configured threshold. Evaluation judges use the configured OpenAI key and can incur additional API charges.
 
 You can supply your own Abaqus `.inp` file. The original cantilever-pipe input generator remains available as a demonstration: it varies the applied displacement of a fixed example model, rather than parameterizing arbitrary input files.
 
@@ -26,7 +26,9 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-On macOS or Linux, use `python3.12 -m venv .venv`, activate with `source .venv/bin/activate`, and copy the template with `cp .env.example .env`. Edit `.env` locally and set `OPENAI_API_KEY`. Never commit the file. `STRESS_THRESHOLD` is optional and expressed in MPa; its default is 360. `OTEL_EXPORTER_OTLP_ENDPOINT` is optional.
+On macOS or Linux, use `python3.12 -m venv .venv`, activate with `source .venv/bin/activate`, and copy the template with `cp .env.example .env`. Edit `.env` locally and set `OPENAI_API_KEY`. Never commit the file. `STRESS_THRESHOLD` is optional and expressed in MPa; its default is 360.
+
+Phoenix defaults to `http://127.0.0.1:6006`. To use another Phoenix server, set `PHOENIX_COLLECTOR_ENDPOINT` to its base URL. The app sends traces to its `/v1/traces` endpoint and reads evaluations from the same server. If `OTEL_EXPORTER_OTLP_ENDPOINT` is already set, remove it or ensure it matches that HTTP trace endpoint to avoid sending traces and queries to different servers.
 
 Start the app from the repository root:
 

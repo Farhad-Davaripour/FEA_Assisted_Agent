@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from llama_index.core.tools import FunctionTool
 from src.eval_utils import parse_stress_mpa, run_eval
@@ -47,14 +47,16 @@ class WorkflowContextTests(unittest.IsolatedAsyncioTestCase):
 
     def test_valid_evaluation_is_not_retried_to_change_the_label(self):
         import pandas as pd
-        source = pd.DataFrame({"start_time": [1]}, index=["test-span"])
-        result = pd.DataFrame({"label": ["not"], "explanation": ["valid"]}, index=source.index)
-        with patch("src.eval_utils.px.Client", create=True) as client, \
-             patch("src.eval_utils.llm_classify", return_value=result) as classify:
-            client.return_value.query_spans.return_value = source
-            graded = run_eval(span_kind="AGENT", select={}, post_process=lambda df: df,
+        source = pd.DataFrame({"start_time": [1], "_fea_trace_id": ["a" * 32]}, index=["test-span"])
+        client = MagicMock()
+        client.spans.get_spans_dataframe.return_value = source
+        result = pd.DataFrame({"test_score": [{"label": "not", "explanation": "valid"}]}, index=source.index)
+        with patch("src.eval_utils.create_classifier"), \
+             patch("src.eval_utils.evaluate_dataframe", return_value=result) as classify:
+            graded = run_eval(trace_id="a" * 32, span_kind="AGENT",
+                              select={"start_time": "start_time"}, post_process=lambda df: df,
                               template="", rails=["hallucinated", "not"], judge=None,
-                              eval_name="test", retries=2)
+                              eval_name="test", retries=2, client=client)
         self.assertEqual(classify.call_count, 1)
         self.assertEqual(graded["label"].iloc[0], "not")
         self.assertEqual(graded["score"].iloc[0], 0.0)

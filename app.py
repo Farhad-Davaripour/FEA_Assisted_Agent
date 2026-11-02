@@ -1,10 +1,10 @@
-import os, json, re, asyncio, uuid, streamlit as st
+import os, json, re, asyncio, uuid, io, contextlib, streamlit as st
+from urllib.parse import urlsplit
 from dotenv import load_dotenv
 
 from phoenix.otel import register
-from phoenix.trace import suppress_tracing, SpanEvaluations
+from phoenix.trace import suppress_tracing
 from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
-from phoenix.trace.dsl import SpanQuery
 import phoenix as px
 from phoenix.evals import LLM
 
@@ -22,8 +22,9 @@ from src.prompt_temp import (
     FINAL_HALLUCINATION_PROMPT_TEMPLATE,
 )
 import pandas as pd
+from opentelemetry.context import Context
 
-from src.eval_utils import run_eval, parse_stress_mpa
+from src.eval_utils import run_eval, parse_stress_mpa, log_stress_eval_real_time
 
 load_dotenv(override=True)
 stress_threshold = float(os.getenv("STRESS_THRESHOLD", 360.0))
@@ -32,18 +33,46 @@ os.makedirs(abaqus_files_dir, exist_ok=True)
 if "fea_session_id" not in st.session_state:
     st.session_state.fea_session_id = uuid.uuid4().hex
 
+# Trace export and evaluation queries must target the same Phoenix service.
+phoenix_base = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://127.0.0.1:6006").rstrip("/")
+parsed_phoenix = urlsplit(phoenix_base)
+if (parsed_phoenix.scheme not in ("http", "https") or not parsed_phoenix.hostname
+        or parsed_phoenix.query or parsed_phoenix.fragment):
+    st.error("PHOENIX_COLLECTOR_ENDPOINT must be a Phoenix HTTP(S) base URL, for example http://127.0.0.1:6006.")
+    st.stop()
+for env_name in ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"):
+    legacy_endpoint = os.getenv(env_name, "").rstrip("/")
+    if legacy_endpoint and legacy_endpoint not in (phoenix_base, phoenix_base + "/v1/traces"):
+        st.error(f"{env_name} conflicts with PHOENIX_COLLECTOR_ENDPOINT. Remove it or point both to the same Phoenix service.")
+        st.stop()
+
 # ---------- observability (run once) ---------- #
 @st.cache_resource(show_spinner=False)
 def init_observability():
     tp = register(
-        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        endpoint=phoenix_base + "/v1/traces",
+        protocol="http/protobuf",
+        project_name="fea-assisted-agent",
+        verbose=False,
         batch=True,
         set_global_tracer_provider=False,
     )
     LlamaIndexInstrumentor().instrument(skip_dep_check=True, tracer_provider=tp)
-    return px.launch_app()
+    # A remote endpoint is assumed to be an already-running service.
+    local = parsed_phoenix.hostname in ("127.0.0.1", "localhost", "::1")
+    if local:
+        # Phoenix 14 prints non-ASCII deprecation warnings for host/port args;
+        # its documented environment settings avoid Windows console failures.
+        os.environ["PHOENIX_HOST"] = parsed_phoenix.hostname
+        os.environ["PHOENIX_PORT"] = str(parsed_phoenix.port or 6006)
+    # Phoenix prints emoji on launch; Windows redirected stdout may use a
+    # non-Unicode codepage and raise UnicodeEncodeError. Streamlit has its own
+    # UI for status, so discard this one-time launch banner.
+    with contextlib.redirect_stdout(io.StringIO()):
+        phoenix_session = px.launch_app() if local else None
+    return phoenix_session, tp
 
-session = init_observability()
+session, tracer_provider = init_observability()
 
 # ---------- LLM picker ---------- #
 llm_type = st.sidebar.selectbox("Select LLM type", ["gpt-4o", "gpt-4.1"])
@@ -102,6 +131,10 @@ async def _run_agent_with_progress(agent_obj, user_query):
 
     async for ev in handler.stream_events():
         if isinstance(ev, ToolCall):
+            # A new job invalidates any stress extracted from an earlier job,
+            # even when the new job later fails or never extracts a result.
+            if ev.tool_name == "Abaqus_job_executor":
+                latest_stress = None
             kwargs_json = json.dumps(ev.tool_kwargs, default=str)
             progress_entries.append(f"**Action** `{ev.tool_name}` with args: `{kwargs_json}`")
         elif isinstance(ev, ToolCallResult):
@@ -192,6 +225,8 @@ default_query = (
 query = st.text_area("Enter your query:", default_query)
 
 if st.button("Submit"):
+    # A new submission must never evaluate or display the preceding trace.
+    st.session_state.fea_trace_id = None
     if upload_conflict:
         st.error("Resolve the input filename conflict before running.")
         st.stop()
@@ -219,9 +254,32 @@ if st.button("Submit"):
             )
             agent, tools = _build_agent(context)
             st.session_state.current_tools = tools
-            result, progress_entries, reasoning_steps, latest_stress = _run_async(
-                _run_agent_with_progress(agent, query_with_inp_context)
-            )
+            # Create a new root even if the Streamlit worker has an ambient
+            # tracing context. Child spans belong to this submission alone.
+            with tracer_provider.get_tracer("fea-assistant").start_as_current_span(
+                "fea-submission", context=Context()
+            ) as root_span:
+                root_span.set_attribute("openinference.span.kind", "AGENT")
+                trace_number = root_span.get_span_context().trace_id
+                trace_id = f"{trace_number:032x}" if isinstance(trace_number, int) and trace_number else None
+                result, progress_entries, reasoning_steps, latest_stress = _run_async(
+                    _run_agent_with_progress(agent, query_with_inp_context)
+                )
+                root_span.set_attribute("input.value", json.dumps({
+                    "query": query_with_inp_context,
+                    "tool_events": progress_entries,
+                    "reasoning_steps": reasoning_steps,
+                }, default=str))
+                root_span.set_attribute("output.value", result.response.content or "")
+            # Only retain traces that were successfully flushed for this turn.
+            if trace_id:
+                try:
+                    if tracer_provider.force_flush(timeout_millis=10000) is not False:
+                        st.session_state.fea_trace_id = trace_id
+                    else:
+                        st.warning("Trace export did not finish; evaluations are unavailable for this submission.")
+                except Exception:
+                    st.warning("Trace export failed; evaluations are unavailable for this submission.")
         except Exception as exc:
             st.error(f"Agent run failed: {exc}")
             st.stop()
@@ -239,6 +297,11 @@ if st.button("Submit"):
         if latest_stress is None:
             st.warning("The Abaqus run completed, but no verified stress was extracted. No stress result is available.")
             st.stop()
+        if st.session_state.get("fea_trace_id"):
+            try:
+                log_stress_eval_real_time(trace_id=st.session_state.fea_trace_id, stress_val=latest_stress)
+            except Exception:
+                st.warning("The stress was extracted, but its Phoenix threshold evaluation could not be saved.")
         final_answer = result.response.content or ""
 
         st.metric("Extracted maximum von Mises stress", f"{latest_stress:g} MPa")
@@ -256,17 +319,39 @@ if st.button("Submit"):
                 )
                 for k, v in step_dict.items():
                     if k not in ("return_direct", "action_input", "is_streaming"):
-                        st.markdown(
-                            f"<span style='color:darkblue;font-weight:bold;'>{k}</span>: {v}",
-                            unsafe_allow_html=True,
-                        )
+                        st.markdown(f"**{k}**: {v}")
                 st.markdown("----")
 # -------------- evaluation helpers -------------- #
 
+def _tool_call_rows(df):
+    rows = []
+    for span_id, row in df.iterrows():
+        messages = row.get("output_messages")
+        if isinstance(messages, str):
+            try:
+                messages = json.loads(messages)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(messages, list):
+            continue
+        try:
+            name, args = extract_action(messages)
+        except (AttributeError, TypeError):
+            continue
+        if name:
+            rows.append({"span_id": span_id, "question": row.get("question"),
+                         "tool_call": f"{name}({args})",
+                         "tool_definitions": str(st.session_state.get("current_tools", []))})
+    if not rows:
+        return pd.DataFrame(columns=["question", "tool_call", "tool_definitions"], index=pd.Index([], name="span_id"))
+    return pd.DataFrame(rows).set_index("span_id")
+
+
 def tool_utilization_eval():
-    judge = LLM(provider="openai", model=llm_type_eval_high, temperature=0)
+    judge = LLM(provider="openai", model=llm_type_eval_high)
     rails = ["correct", "incorrect"]
     return run_eval(
+        trace_id=st.session_state.get("fea_trace_id"),
         span_kind="LLM",
         select=dict(
             start_time="start_time",
@@ -277,24 +362,12 @@ def tool_utilization_eval():
         rails=rails,
         judge=judge,
         eval_name="Tool Utilization",
-        post_process=lambda df: pd.DataFrame(
-            {
-                "question": df["question"],
-                "tool_call": df.apply(
-                    lambda r: (
-                        lambda tool, args: f"{tool}({args})"
-                    )(*extract_action(r.output_messages)),
-                    axis=1,
-                ),
-                "tool_definitions": [st.session_state.get("current_tools", [])] * len(df),
-            },
-            index=df.index,
-        ),
+        post_process=_tool_call_rows,
         retries=2,
     )
 
 def unit_eval():
-    judge = LLM(provider="openai", model=llm_type_eval, temperature=0)
+    judge = LLM(provider="openai", model=llm_type_eval)
     rails = ["correct", "incorrect"]
     tool_lookup = {
         (getattr(t.metadata, "name", None) if hasattr(t, "metadata") else getattr(t, "name", None)): (
@@ -303,6 +376,7 @@ def unit_eval():
         for t in st.session_state.get("current_tools", [])
     }
     return run_eval(
+        trace_id=st.session_state.get("fea_trace_id"),
         span_kind="TOOL",
         select=dict(
             start_time="start_time",
@@ -326,8 +400,9 @@ def unit_eval():
     )
 
 def hallucination_eval():
-    judge = LLM(provider="openai", model=llm_type_eval, temperature=0)
+    judge = LLM(provider="openai", model=llm_type_eval)
     return run_eval(
+        trace_id=st.session_state.get("fea_trace_id"),
         span_kind="AGENT",
         select=dict(
             start_time="start_time",
@@ -343,7 +418,27 @@ def hallucination_eval():
         retries=2,
     )
 
-# Phoenix spans are shared across sessions; avoid attributing another user's
-# trace to this run until observability has explicit per-session trace IDs.
 st.subheader("Offline Evaluation")
-st.info("Offline evaluations are temporarily unavailable until traces can be scoped to this session.")
+if not st.session_state.get("fea_trace_id"):
+    st.info("Run a simulation to create a trace for evaluation in this session.")
+
+def _show_evaluation(label, evaluator):
+    try:
+        graded = evaluator()
+        if graded is None or graded.empty:
+            st.info(f"No matching spans or evaluation results for {label} in this submission.")
+            return
+        if "label" not in graded.columns:
+            st.warning(f"{label} returned an unexpected result format.")
+            return
+        st.dataframe(graded)
+    except Exception as exc:
+        st.warning(f"{label} could not be completed: {exc}")
+
+disabled_eval = not bool(st.session_state.get("fea_trace_id"))
+if st.button("Planning Correctness: Hallucination Eval", disabled=disabled_eval):
+    _show_evaluation("Planning correctness", hallucination_eval)
+if st.button("Tool Utilization: Tool Mapping", disabled=disabled_eval):
+    _show_evaluation("Tool mapping", tool_utilization_eval)
+if st.button("Tool Utilization: Unit Correctness", disabled=disabled_eval):
+    _show_evaluation("Unit correctness", unit_eval)
