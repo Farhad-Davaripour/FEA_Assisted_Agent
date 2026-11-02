@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -109,6 +110,7 @@ class AppSmokeTest(unittest.TestCase):
                 os.chdir(old_cwd)
 
     def test_full_mocked_tool_sequence_displays_extracted_stress(self):
+        import streamlit as st
         from llama_index.core.base.llms.types import CompletionResponse
         from llama_index.core.llms.mock import MockLLM
         from streamlit.testing.v1 import AppTest
@@ -124,6 +126,7 @@ class AppSmokeTest(unittest.TestCase):
 
         app = Path(__file__).resolve().parents[1] / "app.py"
         old_cwd = os.getcwd()
+        st.cache_resource.clear()
         with tempfile.TemporaryDirectory() as cwd:
             try:
                 os.chdir(cwd)
@@ -131,7 +134,7 @@ class AppSmokeTest(unittest.TestCase):
                 inputs.mkdir(parents=True)
                 (inputs / "beam.inp").write_text("*HEADING", encoding="utf-8")
                 with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only", "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false"}), \
-                     patch("phoenix.otel.register"), \
+                     patch("phoenix.otel.register") as register, \
                      patch("phoenix.launch_app"), \
                      patch("openinference.instrumentation.llama_index.LlamaIndexInstrumentor.instrument"), \
                      patch("llama_index.llms.openai.OpenAI", side_effect=lambda **kwargs: ScriptedLLM()), \
@@ -144,6 +147,12 @@ class AppSmokeTest(unittest.TestCase):
                 self.assertEqual(len(result.exception), 0, [str(x) for x in result.exception])
                 self.assertEqual(len(result.error), 0, [str(x.value) for x in result.error])
                 self.assertTrue(any(x.value == "5 MPa" for x in result.metric))
+                span = register.return_value.get_tracer.return_value.start_as_current_span.return_value.__enter__.return_value
+                inputs = [call.args[1] for call in span.set_attribute.call_args_list if call.args[0] == "input.value"]
+                self.assertEqual(len(inputs), 1)
+                definitions = json.loads(inputs[0])["tool_definitions"]
+                extractor = next(item for item in definitions if item["name"] == "Von_Mises_stress_extractor")
+                self.assertIn("maximum stress", extractor["description"])
             finally:
                 os.chdir(old_cwd)
 
